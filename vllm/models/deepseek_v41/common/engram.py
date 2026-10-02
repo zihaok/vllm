@@ -43,6 +43,8 @@ from contextlib import ExitStack
 
 import numpy as np
 import torch
+
+import vllm.envs as envs
 from torch import nn
 
 from vllm.compilation.breakable_cudagraph import eager_break_during_capture
@@ -1292,15 +1294,44 @@ def _engram_select_rows(
     )
 
 
+def _all_to_all_token_slots(dp_group, staged: torch.Tensor, slot: int) -> torch.Tensor:
+    """Send each replica the rows of its own token slot; receive this replica's
+    slot from every shard owner, rank-major ([owner][token][local width])."""
+    world, rank = dp_group.world_size, dp_group.rank_in_group
+    received = torch.empty_like(staged)
+    send = staged.view(world, slot, *staged.shape[1:])
+    recv = received.view(world, slot, *staged.shape[1:])
+    pynccl = getattr(dp_group.device_communicator, "pynccl_comm", None)
+    if pynccl is None or pynccl.disabled:
+        torch.distributed.all_to_all_single(
+            received, staged, group=dp_group.device_group
+        )
+        return received
+    recv[rank].copy_(send[rank])
+    pynccl.group_start()
+    for peer in range(world):
+        if peer != rank:
+            pynccl.send(send[peer], peer)
+            pynccl.recv(recv[peer], peer)
+    pynccl.group_end()
+    return received
+
+
 def _gather_engram_rows(staged: torch.Tensor, num_tokens: int) -> torch.Tensor:
     """Exchange DP tokens for heads, retaining only this replica's tokens."""
     dp_group = get_engram_dp_group()
     assert dp_group is not None
     slot, remainder = divmod(staged.shape[0], dp_group.world_size)
     assert remainder == 0 and 0 <= num_tokens <= slot
-    gathered = dp_group.all_gather(staged, dim=0)
     local_heads, dim = staged.shape[1:]
     rows = staged.new_empty((num_tokens, dp_group.world_size * local_heads, dim))
+    if envs.VLLM_DSV41_ENGRAM_ALL_TO_ALL:
+        # Each replica needs only its own token slot from every shard: an
+        # all-to-all moves a quarter of what the all-gather below lands.
+        received = _all_to_all_token_slots(dp_group, staged, slot)
+        _engram_select_rows(received, rows, slot, 0, local_heads * dim)
+        return rows
+    gathered = dp_group.all_gather(staged, dim=0)
     _engram_select_rows(
         gathered,
         rows,

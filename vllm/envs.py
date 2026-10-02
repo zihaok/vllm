@@ -217,6 +217,7 @@ if TYPE_CHECKING:
     VLLM_USE_FUSED_MOE_GROUPED_TOPK: bool = True
     VLLM_MOE_SKIP_PADDING: bool = True
     VLLM_DSV41_GRAPH_BOUNDED_REPLAY: bool = False
+    VLLM_DSV41_ENGRAM_ALL_TO_ALL: bool = False
     VLLM_KIMI_K3_SHARD_SP_SHARED_EXPERT: bool = False
     VLLM_KIMI_K3_AUX_ATTN_RES_STREAM: bool = False
     VLLM_KIMI_K3_GEMM_AR: bool = True
@@ -1655,6 +1656,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # last window rows instead of running on the whole batch.
     "VLLM_DSV41_GRAPH_BOUNDED_REPLAY": lambda: bool(
         int(os.getenv("VLLM_DSV41_GRAPH_BOUNDED_REPLAY", "0"))
+    ),
+    # DeepSeek-V4.1 Engram tables sharded across DP replicas: return each
+    # replica's looked-up rows with an all-to-all instead of an all-gather.
+    "VLLM_DSV41_ENGRAM_ALL_TO_ALL": lambda: bool(
+        int(os.getenv("VLLM_DSV41_ENGRAM_ALL_TO_ALL", "0"))
     ),
     # Kimi-K3 only. Under sequence-parallel MoE the dense and shared-expert MLPs
     # are replicated on every rank, so each rank streams the whole weight to
