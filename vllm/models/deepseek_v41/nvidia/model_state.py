@@ -230,6 +230,7 @@ class DeepseekV41ModelState(DefaultModelState):
                 self.max_num_reqs, dtype=torch.int32, device=device
             )
             self._replay_attn_groups: list[list[AttentionGroup]] | None = None
+            self.decoder_replay_layers.max_num_tokens = self.max_num_tokens
 
     def add_request(self, req_index: int, new_req_data: NewRequestData) -> None:
         super().add_request(req_index, new_req_data)
@@ -411,13 +412,19 @@ class DeepseekV41ModelState(DefaultModelState):
         replay_start: torch.Tensor,
     ) -> None:
         """Set the replay layers' batch for this forward, or none when nothing
-        trims. Only eager steps trim: a CUDA graph keeps the layers on the whole
-        batch, and ranks share the graph mode. Under data parallelism every rank
-        replays if any does."""
+        trims. Eager steps trim through the layers' eager path; under data
+        parallelism every rank replays if any does. FULL graphs keep the layers
+        on the whole batch. With the graph seam (VLLM_DSV41_GRAPH_BOUNDED_REPLAY)
+        every piecewise step -- and every capture, which runs here as an eager
+        step -- also gets a replay batch on persistent buffers, trimmed or
+        whole, whose graph the seam replays; ranks replay independently."""
         layers = self.decoder_replay_layers
         assert layers is not None
         layers.rows = layers.forward_context = None
-        if cudagraph_mode != CUDAGraphMode.NONE:
+        layers.graph_forward_context = None
+        if cudagraph_mode == CUDAGraphMode.FULL or (
+            cudagraph_mode != CUDAGraphMode.NONE and not layers.graph_enabled
+        ):
             return
 
         num_reqs = input_batch.num_reqs
@@ -432,6 +439,22 @@ class DeepseekV41ModelState(DefaultModelState):
         trims = bool(
             (kept_lens < query_lens)[input_batch.is_prefilling_np[:num_reqs]].any()
         )
+        if cudagraph_mode == CUDAGraphMode.PIECEWISE or (
+            layers.graph_enabled and not trims
+        ):
+            self._prepare_replay_graph_batch(
+                input_batch,
+                cudagraph_mode,
+                block_tables,
+                slot_mappings,
+                attn_groups,
+                kv_cache_config,
+                replay_start,
+                kept_lens if trims else query_lens,
+                trims,
+            )
+            if cudagraph_mode == CUDAGraphMode.PIECEWISE:
+                return
         num_tokens = int(kept_lens.sum())
         dp_metadata = None
         if self.vllm_config.parallel_config.data_parallel_size > 1:
@@ -463,12 +486,62 @@ class DeepseekV41ModelState(DefaultModelState):
             ),
         )
 
+    def _prepare_replay_graph_batch(
+        self,
+        input_batch: InputBatch,
+        cudagraph_mode: CUDAGraphMode,
+        block_tables: tuple[torch.Tensor, ...],
+        slot_mappings: torch.Tensor,
+        attn_groups: list[list[AttentionGroup]],
+        kv_cache_config: KVCacheConfig,
+        replay_start: torch.Tensor,
+        kept_lens: np.ndarray,
+        trims: bool,
+    ) -> None:
+        """The graph seam's replay batch: the kept rows padded to the smallest
+        captured replay graph, or the whole batch at its graph size."""
+        layers = self.decoder_replay_layers
+        assert layers is not None
+        num_tokens_padded = input_batch.num_tokens_after_padding
+        if cudagraph_mode == CUDAGraphMode.PIECEWISE and not layers.has_graph(
+            num_tokens_padded
+        ):
+            # This size's graph runs the layers inline on the whole batch.
+            return
+        num_tokens = int(kept_lens.sum())
+        size = layers.graph_size_for(num_tokens) if trims else num_tokens_padded
+        kept_batch, kept_slot_mappings = self._kept_input_batch(
+            input_batch, slot_mappings, replay_start, kept_lens, size
+        )
+        attn_metadata = super().prepare_attn(
+            kept_batch,
+            CUDAGraphMode.NONE,
+            block_tables,
+            kept_slot_mappings,
+            self._replay_groups(attn_groups),
+            kv_cache_config,
+            model_specific_attn_metadata=ReplayAttnMetadata(
+                self._kept_kv_start[: input_batch.num_reqs]
+            ),
+        )
+        layers.rows = self._kept_rows[:num_tokens] if trims else None
+        layers.graph_forward_context = create_forward_context(
+            attn_metadata,
+            self.vllm_config,
+            slot_mapping=build_slot_mappings_by_layer(
+                kept_slot_mappings, kv_cache_config
+            ),
+        )
+        layers.graph_num_tokens = num_tokens
+        layers.graph_num_tokens_padded = size
+
     def _kept_input_batch(
         self,
         input_batch: InputBatch,
         slot_mappings: torch.Tensor,
         replay_start: torch.Tensor,
         kept_lens: np.ndarray,
+        num_tokens_padded: int | None = None,
     ) -> tuple[InputBatch, torch.Tensor]:
         """Build the sub-``InputBatch`` of each request's last ``kept_lens``
         rows, and its slot mappings.
@@ -477,16 +550,22 @@ class DeepseekV41ModelState(DefaultModelState):
         them: adaptive verification resizes the decodes on the GPU alone, and
         decodes never trim. Like a microbatch's, the sub-batch describes the
         forward only; its sampling fields are carried over and must not be read.
+        ``num_tokens_padded`` sizes it for a captured graph: the padding rows'
+        slots are PAD_SLOT_ID so the graph's cache writes skip them.
         """
         num_reqs = input_batch.num_reqs
         num_tokens = int(kept_lens.sum())
+        if num_tokens_padded is None:
+            num_tokens_padded = num_tokens
         kept_query_start_loc_np = np.zeros(num_reqs + 1, dtype=np.int32)
         np.cumsum(kept_lens, out=kept_query_start_loc_np[1:])
         dropped_before = self._dropped_before.copy_to_uva(
             input_batch.query_start_loc_np[: num_reqs + 1] - kept_query_start_loc_np
         )
         assert self._kept_slot_mappings is not None
-        kept_slot_mappings = self._kept_slot_mappings[:, :num_tokens]
+        kept_slot_mappings = self._kept_slot_mappings[:, :num_tokens_padded]
+        if num_tokens_padded > num_tokens:
+            kept_slot_mappings[:, num_tokens:].fill_(PAD_SLOT_ID)
         _gather_replay_batch_kernel[(num_reqs,)](
             input_batch.query_start_loc,
             dropped_before,
@@ -511,7 +590,7 @@ class DeepseekV41ModelState(DefaultModelState):
         kept_batch = replace(
             input_batch,
             num_tokens=num_tokens,
-            num_tokens_after_padding=num_tokens,
+            num_tokens_after_padding=num_tokens_padded,
             query_start_loc=self._kept_query_start_loc[: num_reqs + 1],
             query_start_loc_np=kept_query_start_loc_np,
             max_query_len=max_query_len,

@@ -137,7 +137,9 @@ class BreakableCUDAGraphCapture:
         cap.replay()
         # Output tensors live at the same addresses as during capture.
 
-    Thread-local: only one capture may be active per thread.
+    Thread-local: one capture is active per thread. An eager break may open a
+    nested capture (its own segments and pool) while the outer one is paused;
+    the outer capture resumes when the nested one exits.
     """
 
     _tls = threading.local()
@@ -157,12 +159,18 @@ class BreakableCUDAGraphCapture:
         self._num_eager_breaks: int = 0
         self._current_graph: torch.cuda.CUDAGraph | None = None
         self._capturing: bool = False
+        self._outer: BreakableCUDAGraphCapture | None = None
 
     # --- context manager protocol ----------------------------------------
 
     def __enter__(self) -> BreakableCUDAGraphCapture:
-        if getattr(BreakableCUDAGraphCapture._tls, "active", None) is not None:
-            raise RuntimeError("Nested BreakableCUDAGraphCapture is not supported.")
+        outer = getattr(BreakableCUDAGraphCapture._tls, "active", None)
+        if outer is not None and outer._capturing:
+            raise RuntimeError(
+                "Nested BreakableCUDAGraphCapture is only supported inside an "
+                "eager break of the outer capture."
+            )
+        self._outer = outer
         BreakableCUDAGraphCapture._tls.active = self
         self._begin_segment()
         return self
@@ -171,7 +179,8 @@ class BreakableCUDAGraphCapture:
         try:
             self._end_segment()
         finally:
-            BreakableCUDAGraphCapture._tls.active = None
+            BreakableCUDAGraphCapture._tls.active = self._outer
+            self._outer = None
 
     # --- segment management ----------------------------------------------
 
