@@ -604,6 +604,7 @@ def sparse_attn_indexer(
                             chunk_candidates.shape[1],
                             candidate_block_size,
                             chunk_candidates,
+                            max_row_len=attn_metadata_narrowed.max_seq_len,
                         )
                     else:
                         _apply_candidate_mask(
@@ -753,6 +754,7 @@ def sparse_attn_indexer(
                     candidate_block_size,
                     decode_candidates,
                     row_repeat,
+                    max_row_len=attn_metadata_narrowed.max_seq_len,
                 )
             else:
                 _apply_candidate_mask(

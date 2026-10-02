@@ -146,11 +146,18 @@ def select_candidate_blocks(
     block_size: int,
     out: torch.Tensor,
     row_repeat: int = 1,
+    max_row_len: int | None = None,
 ) -> None:
     """Select local block IDs by maximum score, pinning each row's newest block.
 
     Row bounds are in packed column space; absent starts mean zero.
     Decode rows share bounds in groups of ``row_repeat``. Output is -1 padded.
+
+    ``max_row_len`` is an optional host-side upper bound on every row's
+    ``end - start``. Logits are allocated ``max_model_len`` wide, so without it
+    the scores and the top-k sweep that whole width. Blocks past a row's end
+    score -inf and are never kept, and top-k breaks ties by lowest index, so
+    the bound leaves the selected set unchanged.
     """
     assert logits.is_cuda
     rows, width = logits.shape
@@ -159,7 +166,8 @@ def select_candidate_blocks(
     if not width:
         out.fill_(-1)
         return
-    nblocks = triton.cdiv(width, block_size)
+    score_width = width if max_row_len is None else max(1, min(width, max_row_len))
+    nblocks = triton.cdiv(score_width, block_size)
     scores = logits.new_empty((rows, nblocks))
     _block_scores_kernel[(rows, triton.cdiv(nblocks, 128))](
         logits,
