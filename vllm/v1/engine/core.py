@@ -1350,6 +1350,11 @@ class EngineCoreProc(EngineCore):
     @staticmethod
     def run_engine_core(*args, dp_rank: int = 0, local_dp_rank: int = 0, **kwargs):
         """Launch EngineCore busy loop in background process."""
+        # Benchmark knob: external-LB DP ranks co-located on one node with all
+        # GPUs visible (symmetric-memory MoE needs distinct device ordinals)
+        # select their device by this local DP rank instead of 0.
+        if (rank_override := os.environ.get("VLLM_DP_RANK_LOCAL_OVERRIDE")) is not None:
+            local_dp_rank = int(rank_override)
         vllm_config: VllmConfig = kwargs["vllm_config"]
         if logging_config := getattr(vllm_config, "logging_config", None):
             configure_logging(logging_config)
