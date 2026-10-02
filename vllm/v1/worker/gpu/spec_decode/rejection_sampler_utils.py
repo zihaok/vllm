@@ -384,7 +384,7 @@ def _compute_cumulative_log_p_kernel(
         tl.store(cumulative_log_p_ptr + logit_idx, log_p)
 
 
-@triton.jit
+@triton.jit(do_not_specialize=["num_logits"])
 def _compute_local_residual_mass_kernel(
     # [num_logits, num_blocks]
     local_residual_mass_ptr,
@@ -421,6 +421,7 @@ def _compute_local_residual_mass_kernel(
     vocab_size,
     num_speculative_steps,
     vocab_num_blocks,
+    num_logits,
     BLOCK_SIZE: tl.constexpr,
     PADDED_VOCAB_NUM_BLOCKS: tl.constexpr,
 ):
@@ -432,7 +433,14 @@ def _compute_local_residual_mass_kernel(
         # first and last (bonus) positions aren't needed for this computation.
         return
 
-    if tl.load(draft_sampled_ptr + logit_idx + 1) < 0:
+    # Adaptive verification and draft budgets leave requests with fewer than
+    # num_speculative_steps drafts, so a request's last (bonus) row can pass the
+    # position check above. The launch's last row is always such a row, and its
+    # successor lies past the end of draft_sampled: read it as the -1 placeholder.
+    next_draft = tl.load(
+        draft_sampled_ptr + logit_idx + 1, mask=logit_idx + 1 < num_logits, other=-1
+    )
+    if next_draft < 0:
         # -1 placeholder token. The rejection kernel treats the preceding token
         # as the end of the block, so this position's residual mass is unused.
         return
@@ -1203,6 +1211,7 @@ def rejection_sample(
                 vocab_size,
                 num_speculative_steps,
                 vocab_num_blocks,
+                num_logits,
                 BLOCK_SIZE=VOCAB_BLOCK_SIZE,
                 PADDED_VOCAB_NUM_BLOCKS=padded_vocab_num_blocks,
             )
