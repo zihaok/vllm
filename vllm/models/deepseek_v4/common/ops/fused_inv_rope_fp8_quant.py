@@ -6,6 +6,7 @@ Output scale format is pre-transformed (MN-major TMA-aligned; FP32 on SM90,
 INT32-packed UE8M0 on SM100) so fp8_einsum skips transform_sf_into_required_layout.
 """
 
+import os
 from dataclasses import dataclass
 from typing import Any
 
@@ -22,6 +23,159 @@ from vllm.triton_utils import tl, triton
 from vllm.utils.torch_utils import direct_register_custom_op
 
 
+# Tuned on GB300 (bench_inv_rope.py): 4 heads x 2 warps per program is ~2.2x the
+# original one-warp-per-head launch at 2-6k tokens; outputs are bitwise identical.
+_INV_ROPE_HEADS_PER_PROG = int(os.environ.get("VLLM_INV_ROPE_HEADS_PER_PROG", "4"))
+_INV_ROPE_NUM_WARPS = int(os.environ.get("VLLM_INV_ROPE_NUM_WARPS", "2"))
+
+
+def _heads_per_prog(heads_per_group: int) -> int:
+    hpp = max(1, min(_INV_ROPE_HEADS_PER_PROG, heads_per_group))
+    while heads_per_group % hpp:
+        hpp -= 1
+    return hpp
+
+
+@triton.jit
+def _inv_rope_quant_one_head(
+    o_ptr,
+    positions_ptr,
+    cos_sin_cache_ptr,
+    out_ptr,
+    scale_ptr,
+    num_tokens,
+    heads_per_group,
+    o_stride_token,
+    o_stride_head,
+    cache_stride_pos,
+    out_stride_group,
+    out_stride_token,
+    scale_stride_group,
+    scale_stride_k,
+    fp8_max: tl.constexpr,
+    eps: tl.constexpr,
+    QUANT_GROUP_SIZE: tl.constexpr,
+    CHUNKS_PER_HEAD: tl.constexpr,
+    NOPE_DIM: tl.constexpr,
+    HALF_ROPE: tl.constexpr,
+    QUANTIZE: tl.constexpr,
+    TMA_ALIGNED_SCALES: tl.constexpr,
+    pid_token,
+    pid_gh,
+):
+    g = pid_gh // heads_per_group
+    head_in_group = pid_gh % heads_per_group
+    global_head = pid_gh
+    qb_start = head_in_group * CHUNKS_PER_HEAD
+    if pid_token >= num_tokens:
+        # Padding rows in the TMA-aligned scale buffer: zero scales, skip quant.
+        if QUANTIZE:
+            if TMA_ALIGNED_SCALES:
+                packed_offsets = tl.arange(0, CHUNKS_PER_HEAD // 4)
+                scale_addr = (
+                    scale_ptr
+                    + g * scale_stride_group
+                    + pid_token
+                    + (head_in_group * (CHUNKS_PER_HEAD // 4) + packed_offsets)
+                    * scale_stride_k
+                )
+                tl.store(
+                    scale_addr, tl.zeros((CHUNKS_PER_HEAD // 4,), dtype=tl.int32)
+                )
+            else:
+                block_offsets = tl.arange(0, CHUNKS_PER_HEAD)
+                qb_indices = qb_start + block_offsets
+                scale_addrs = (
+                    scale_ptr
+                    + g * scale_stride_group
+                    + pid_token
+                    + qb_indices * scale_stride_k
+                )
+                tl.store(
+                    scale_addrs, tl.zeros((CHUNKS_PER_HEAD,), dtype=tl.float32)
+                )
+    else:
+        input_base = (
+            o_ptr + pid_token * o_stride_token + global_head * o_stride_head
+        )
+
+        HEAD_DIM: tl.constexpr = CHUNKS_PER_HEAD * QUANT_GROUP_SIZE
+        offsets = tl.arange(0, HEAD_DIM)
+        x = tl.load(input_base + offsets).to(tl.float32)
+
+        rope_abs_start: tl.constexpr = NOPE_DIM
+        pos = tl.load(positions_ptr + pid_token)
+        cache_base = cos_sin_cache_ptr + pos * cache_stride_pos
+        is_rope = offsets >= rope_abs_start
+        rope_local = offsets - rope_abs_start
+
+        x_partner = tl.load(
+            input_base + (offsets ^ 1), mask=is_rope, other=0.0
+        ).to(tl.float32)
+        cs_idx = tl.maximum(rope_local >> 1, 0)
+        cos_v = tl.load(cache_base + cs_idx, mask=is_rope, other=1.0)
+        sin_v = tl.load(cache_base + HALF_ROPE + cs_idx, mask=is_rope, other=0.0)
+        x_add = x * cos_v + x_partner * sin_v
+        x_sub = x * cos_v - x_partner * sin_v
+        is_even = (rope_local & 1) == 0
+        rotated = tl.where(is_even, x_add, x_sub)
+        x = tl.where(is_rope, rotated, x)
+
+        out_base = (
+            out_ptr
+            + g * out_stride_group
+            + pid_token * out_stride_token
+            + qb_start * QUANT_GROUP_SIZE
+        )
+        if not QUANTIZE:
+            tl.store(out_base + offsets, x)
+        else:
+            x_2d = tl.reshape(tl.abs(x), (CHUNKS_PER_HEAD, QUANT_GROUP_SIZE))
+            block_absmax = tl.maximum(tl.max(x_2d, axis=1), eps)
+            scale_raw = block_absmax * (1.0 / fp8_max)
+            scales = tl.math.exp2(tl.ceil(tl.log2(scale_raw)))
+
+            scales_exp = tl.reshape(
+                tl.broadcast_to(
+                    tl.reshape(scales, (CHUNKS_PER_HEAD, 1)),
+                    (CHUNKS_PER_HEAD, QUANT_GROUP_SIZE),
+                ),
+                (HEAD_DIM,),
+            )
+            x_quant = tl.clamp(x / scales_exp, -fp8_max, fp8_max).to(
+                tl.float8e4nv
+            )
+            tl.store(out_base + offsets, x_quant)
+
+            block_offsets = tl.arange(0, CHUNKS_PER_HEAD)
+            qb_indices = qb_start + block_offsets
+            if TMA_ALIGNED_SCALES:
+                scale_bits = scales.to(tl.int32, bitcast=True)
+                ue8m0_bytes = (scale_bits >> 23) & 0xFF
+                packed_val = tl.sum(
+                    tl.reshape(ue8m0_bytes, (CHUNKS_PER_HEAD // 4, 4))
+                    << (tl.arange(0, 4)[None, :] * 8),
+                    axis=1,
+                )
+                packed_offsets = tl.arange(0, CHUNKS_PER_HEAD // 4)
+                scale_addr = (
+                    scale_ptr
+                    + g * scale_stride_group
+                    + pid_token
+                    + (head_in_group * (CHUNKS_PER_HEAD // 4) + packed_offsets)
+                    * scale_stride_k
+                )
+                tl.store(scale_addr, packed_val)
+            else:
+                scale_addrs = (
+                    scale_ptr
+                    + g * scale_stride_group
+                    + pid_token
+                    + qb_indices * scale_stride_k
+                )
+                tl.store(scale_addrs, scales)
+
+
 class FusedInvRopeFP8QuantKernel(
     VllmTritonJitKernel["FusedInvRopeFP8QuantKernel.CompileKey"]
 ):
@@ -36,6 +190,8 @@ class FusedInvRopeFP8QuantKernel(
         tma_aligned_scales: bool
         launch_pdl: bool
         quantize: bool
+        heads_per_prog: int = 1
+        num_warps: int = 1
 
     @staticmethod
     # scale_stride_k = align(num_tokens, 4) is only 4-aligned, so its Triton int
@@ -66,7 +222,12 @@ class FusedInvRopeFP8QuantKernel(
         QUANTIZE: tl.constexpr,
         TMA_ALIGNED_SCALES: tl.constexpr,
         launch_pdl: tl.constexpr,
+        HEADS_PER_PROG: tl.constexpr = 1,
     ):
+        # Each program handles HEADS_PER_PROG consecutive heads of one token
+        # (HEADS_PER_PROG divides heads_per_group, so they share a group). More
+        # heads and warps per program raise memory-level parallelism; the
+        # per-element math is unchanged, so outputs are bitwise identical.
         # Cast every stride to int64 — without this, Python-int strides are
         # inferred as int32 and `pid_token(int64) × stride(int32)` can lower to
         # int32 arithmetic, wrapping past 2³¹ for large prefill batches → IMA.
@@ -80,122 +241,18 @@ class FusedInvRopeFP8QuantKernel(
         scale_stride_group = scale_stride_group.to(tl.int64)
         scale_stride_k = scale_stride_k.to(tl.int64)
 
-        g = pid_gh // heads_per_group
-        head_in_group = pid_gh % heads_per_group
-        global_head = pid_gh
-        qb_start = head_in_group * CHUNKS_PER_HEAD
         if launch_pdl:
             tl.extra.cuda.gdc_launch_dependents()
             tl.extra.cuda.gdc_wait()
-        # Padding rows in the TMA-aligned scale buffer: fill with zero and skip quant.
-        if pid_token >= num_tokens:
-            if not QUANTIZE:
-                return
-            if TMA_ALIGNED_SCALES:
-                packed_offsets = tl.arange(0, CHUNKS_PER_HEAD // 4)
-                scale_addr = (
-                    scale_ptr
-                    + g * scale_stride_group
-                    + pid_token
-                    + (head_in_group * (CHUNKS_PER_HEAD // 4) + packed_offsets)
-                    * scale_stride_k
-                )
-                tl.store(scale_addr, tl.zeros((CHUNKS_PER_HEAD // 4,), dtype=tl.int32))
-            else:
-                block_offsets = tl.arange(0, CHUNKS_PER_HEAD)
-                qb_indices = qb_start + block_offsets
-                scale_addrs = (
-                    scale_ptr
-                    + g * scale_stride_group
-                    + pid_token
-                    + qb_indices * scale_stride_k
-                )
-                tl.store(scale_addrs, tl.zeros((CHUNKS_PER_HEAD,), dtype=tl.float32))
-            return
-
-        input_base = o_ptr + pid_token * o_stride_token + global_head * o_stride_head
-
-        HEAD_DIM: tl.constexpr = CHUNKS_PER_HEAD * QUANT_GROUP_SIZE
-        offsets = tl.arange(0, HEAD_DIM)
-        x = tl.load(input_base + offsets).to(tl.float32)
-
-        rope_abs_start: tl.constexpr = NOPE_DIM
-        pos = tl.load(positions_ptr + pid_token)
-        cache_base = cos_sin_cache_ptr + pos * cache_stride_pos
-        is_rope = offsets >= rope_abs_start
-        rope_local = offsets - rope_abs_start
-
-        x_partner = tl.load(input_base + (offsets ^ 1), mask=is_rope, other=0.0).to(
-            tl.float32
-        )
-        cs_idx = tl.maximum(rope_local >> 1, 0)
-        cos_v = tl.load(cache_base + cs_idx, mask=is_rope, other=1.0)
-        sin_v = tl.load(cache_base + HALF_ROPE + cs_idx, mask=is_rope, other=0.0)
-        x_add = x * cos_v + x_partner * sin_v
-        x_sub = x * cos_v - x_partner * sin_v
-        is_even = (rope_local & 1) == 0
-        rotated = tl.where(is_even, x_add, x_sub)
-        x = tl.where(is_rope, rotated, x)
-
-        if not QUANTIZE:
-            out_base = (
-                out_ptr
-                + g * out_stride_group
-                + pid_token * out_stride_token
-                + qb_start * QUANT_GROUP_SIZE
+        for hh in tl.static_range(HEADS_PER_PROG):
+            _inv_rope_quant_one_head(
+                o_ptr, positions_ptr, cos_sin_cache_ptr, out_ptr, scale_ptr,
+                num_tokens, heads_per_group, o_stride_token, o_stride_head,
+                cache_stride_pos, out_stride_group, out_stride_token,
+                scale_stride_group, scale_stride_k, fp8_max, eps,
+                QUANT_GROUP_SIZE, CHUNKS_PER_HEAD, NOPE_DIM, HALF_ROPE, QUANTIZE,
+                TMA_ALIGNED_SCALES, pid_token, pid_gh * HEADS_PER_PROG + hh,
             )
-            tl.store(out_base + offsets, x)
-            return
-
-        x_2d = tl.reshape(tl.abs(x), (CHUNKS_PER_HEAD, QUANT_GROUP_SIZE))
-        block_absmax = tl.maximum(tl.max(x_2d, axis=1), eps)
-        scale_raw = block_absmax * (1.0 / fp8_max)
-        scales = tl.math.exp2(tl.ceil(tl.log2(scale_raw)))
-
-        scales_exp = tl.reshape(
-            tl.broadcast_to(
-                tl.reshape(scales, (CHUNKS_PER_HEAD, 1)),
-                (CHUNKS_PER_HEAD, QUANT_GROUP_SIZE),
-            ),
-            (HEAD_DIM,),
-        )
-        x_quant = tl.clamp(x / scales_exp, -fp8_max, fp8_max).to(tl.float8e4nv)
-
-        out_base = (
-            out_ptr
-            + g * out_stride_group
-            + pid_token * out_stride_token
-            + qb_start * QUANT_GROUP_SIZE
-        )
-        tl.store(out_base + offsets, x_quant)
-
-        block_offsets = tl.arange(0, CHUNKS_PER_HEAD)
-        qb_indices = qb_start + block_offsets
-        if TMA_ALIGNED_SCALES:
-            scale_bits = scales.to(tl.int32, bitcast=True)
-            ue8m0_bytes = (scale_bits >> 23) & 0xFF
-            packed_val = tl.sum(
-                tl.reshape(ue8m0_bytes, (CHUNKS_PER_HEAD // 4, 4))
-                << (tl.arange(0, 4)[None, :] * 8),
-                axis=1,
-            )
-            packed_offsets = tl.arange(0, CHUNKS_PER_HEAD // 4)
-            scale_addr = (
-                scale_ptr
-                + g * scale_stride_group
-                + pid_token
-                + (head_in_group * (CHUNKS_PER_HEAD // 4) + packed_offsets)
-                * scale_stride_k
-            )
-            tl.store(scale_addr, packed_val)
-        else:
-            scale_addrs = (
-                scale_ptr
-                + g * scale_stride_group
-                + pid_token
-                + qb_indices * scale_stride_k
-            )
-            tl.store(scale_addrs, scales)
 
     def dispatch(  # type: ignore[override]
         self,
@@ -266,6 +323,8 @@ class FusedInvRopeFP8QuantKernel(
             tma_aligned_scales=capability.major >= 10,
             launch_pdl=current_platform.is_arch_support_pdl(),
             quantize=True,
+            heads_per_prog=_heads_per_prog(local_heads // local_groups),
+            num_warps=_INV_ROPE_NUM_WARPS,
         )
 
     def warmup_inputs(self, compile_key: CompileKey) -> dict[str, Any]:
@@ -302,7 +361,9 @@ class FusedInvRopeFP8QuantKernel(
             quantize=compile_key.quantize,
             fp8_max=compile_key.fp8_max,
             launch_pdl=compile_key.launch_pdl,
-            grid=(1, compile_key.heads_per_group),
+            heads_per_prog=compile_key.heads_per_prog,
+            num_warps=compile_key.num_warps,
+            grid=(1, compile_key.heads_per_group // compile_key.heads_per_prog),
         )
 
     @kernel_launcher
@@ -325,6 +386,8 @@ class FusedInvRopeFP8QuantKernel(
         fp8_max: float,
         launch_pdl: bool,
         grid: tuple[int, int],
+        heads_per_prog: int = 1,
+        num_warps: int = 1,
     ) -> LaunchSpec:
         return grid, dict(
             out_ptr=out_buf,
@@ -344,8 +407,9 @@ class FusedInvRopeFP8QuantKernel(
             QUANTIZE=quantize,
             TMA_ALIGNED_SCALES=tma_aligned_scales,
             launch_pdl=launch_pdl,
+            HEADS_PER_PROG=heads_per_prog,
             num_stages=1,
-            num_warps=1,
+            num_warps=num_warps,
         )
 
 
@@ -468,7 +532,8 @@ def _fused_inv_rope_fp8_quant_kernel_impl(
         )
     else:
         scale_buf = torch.empty(0, dtype=scale_dtype, device=o.device)
-    grid = (tma_aligned_T, n_groups * heads_per_group)
+    heads_per_prog = _heads_per_prog(heads_per_group)
+    grid = (tma_aligned_T, n_groups * heads_per_group // heads_per_prog)
     launch_pdl = current_platform.is_arch_support_pdl()
     _FUSED_INV_ROPE_FP8_QUANT_KERNEL(
         o,
@@ -487,6 +552,8 @@ def _fused_inv_rope_fp8_quant_kernel_impl(
         fp8_max=fp8_max,
         launch_pdl=launch_pdl,
         grid=grid,
+        heads_per_prog=heads_per_prog,
+        num_warps=_INV_ROPE_NUM_WARPS,
     )
     return out_buf, scale_buf
 
