@@ -196,6 +196,11 @@ def kernel_warmup(worker: "Worker", *, process_local_only: bool = False):
 
     # Run next so input-prep kernels JIT against pristine runner state.
     if enable_jit_warmup:
+        from vllm.v1.worker.gpu.spec_decode.dflash.speculator import DFlashSpeculator
+
+        speculator = getattr(worker.model_runner, "speculator", None)
+        if isinstance(speculator, DFlashSpeculator):
+            speculator.warmup_prepare_inputs()
         kimi_k3_triton_warmup(worker)
         watermark_sample_warmup(worker)
         qwen4_exp_qsa_triton_warmup(worker)

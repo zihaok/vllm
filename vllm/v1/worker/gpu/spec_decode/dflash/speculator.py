@@ -247,6 +247,46 @@ class DFlashSpeculator(DraftModelSpeculator):
                     )
                 }
 
+    def warmup_prepare_inputs(self) -> None:
+        input_batch = InputBatch.make_dummy(
+            1, self.max_num_tokens, self.target_input_buffers
+        )
+        counts = torch.zeros(self.max_num_reqs, dtype=torch.int32, device=self.device)
+        token_ids = torch.zeros(self.max_num_reqs, dtype=torch.int64, device=self.device)
+        torch.accelerator.synchronize()
+        for i, gid in enumerate(self.draft_kv_cache_group_ids):
+            prepare_dflash_inputs(
+                self.input_buffers,
+                self.block_tables.slot_mappings[gid],
+                self.context_positions,
+                self._context_slot_mappings[i],
+                self.sample_indices,
+                self.sample_pos,
+                self.sample_idx_mapping,
+                self.temperature,
+                self.seeds,
+                input_batch,
+                counts,
+                counts,
+                token_ids,
+                counts,
+                self.temperature,
+                self.seeds,
+                self.block_tables.input_block_tables[gid],
+                self.block_tables.kernel_block_sizes[gid],
+                self.block_tables.cp_rank,
+                self.dcp_size,
+                self.block_tables.cp_interleave,
+                self.parallel_drafting_token_id,
+                self.num_query_per_req,
+                self.num_speculative_steps,
+                self.max_num_reqs,
+                self.max_num_tokens,
+                self.max_model_len,
+                self.sample_from_anchor,
+                warmup=True,
+            )
+
     @torch.inference_mode()
     def _run_model(
         self,
@@ -754,6 +794,7 @@ def prepare_dflash_inputs(
     max_num_tokens: int,
     max_model_len: int,
     sample_from_anchor: bool = False,
+    warmup: bool = False,
 ) -> None:
     num_reqs = input_batch.num_reqs
     assert num_reqs > 0
@@ -763,7 +804,7 @@ def prepare_dflash_inputs(
     max_tokens_per_req = max_target_query_len + num_query_per_req
     BLOCK_SIZE = min(256, triton.next_power_of_2(max(1, max_tokens_per_req)))
     num_blocks = triton.cdiv(max_tokens_per_req, BLOCK_SIZE)
-    _prepare_dflash_inputs_kernel[(num_reqs, num_blocks)](
+    kernel_args = (
         input_buffers.input_ids,
         input_buffers.positions,
         input_buffers.query_start_loc,
@@ -795,9 +836,22 @@ def prepare_dflash_inputs(
         max_num_tokens,
         max_model_len,
         cp_rank,
+    )
+    kernel_kwargs = dict(
         SAMPLE_FROM_ANCHOR=sample_from_anchor,
         PAD_SLOT_ID=PAD_SLOT_ID,
         CP_SIZE=cp_size,
         CP_INTERLEAVE=cp_interleave,
-        BLOCK_SIZE=BLOCK_SIZE,
     )
+    if warmup:
+        min_block = min(256, triton.next_power_of_2(num_query_per_req + 1))
+        for power in range(min_block.bit_length() - 1, BLOCK_SIZE.bit_length()):
+            compiled = _prepare_dflash_inputs_kernel.warmup(
+                *kernel_args, **kernel_kwargs, BLOCK_SIZE=1 << power, grid=(1, 1)
+            )
+            # Triton warmup compiles the cubin but leaves CUDA module loading lazy.
+            compiled._init_handles()
+    else:
+        _prepare_dflash_inputs_kernel[(num_reqs, num_blocks)](
+            *kernel_args, **kernel_kwargs, BLOCK_SIZE=BLOCK_SIZE
+        )

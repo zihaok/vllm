@@ -11,6 +11,8 @@ import torch
 from vllm.v1.attention.backends.utils import PAD_SLOT_ID
 from vllm.v1.worker.gpu.spec_decode.dflash.speculator import (
     DFlashSpeculator,
+    _prepare_dflash_inputs_kernel,
+    prepare_dflash_inputs,
 )
 
 pytestmark = pytest.mark.skipif(
@@ -26,10 +28,11 @@ def _run_prepare(
     cp_size: int = 1,
     cp_interleave: int = 1,
     draft_dcp_size: int | None = None,
+    warmup: bool = False,
 ):
     device = torch.device("cuda")
     max_num_reqs = 4
-    max_num_tokens = 16
+    max_num_tokens = max(16, len(target_positions) + 3)
     num_speculative_steps = 3
 
     input_buffers = SimpleNamespace(
@@ -42,11 +45,13 @@ def _run_prepare(
     )
     input_batch = SimpleNamespace(
         num_reqs=1,
-        num_tokens=4,
-        num_scheduled_tokens=np.array([4], dtype=np.int32),
+        num_tokens=len(target_positions),
+        num_scheduled_tokens=np.array([len(target_positions)], dtype=np.int32),
         seq_lens_cpu_upper_bound=torch.tensor([target_positions[-1] + 1]),
         positions=torch.tensor(target_positions, dtype=torch.int64, device=device),
-        query_start_loc=torch.tensor([0, 4], dtype=torch.int32, device=device),
+        query_start_loc=torch.tensor(
+            [0, len(target_positions)], dtype=torch.int32, device=device
+        ),
         idx_mapping=torch.tensor([2], dtype=torch.int32, device=device),
     )
     query_slot_mapping = torch.full(
@@ -90,7 +95,7 @@ def _run_prepare(
         sample_idx_mapping=sample_idx_mapping,
         temperature=temperature,
         seeds=seeds,
-        hidden_states=torch.zeros(4, 1, device=device),
+        hidden_states=torch.zeros(len(target_positions), 1, device=device),
         prepare_context_anchor=lambda *args: None,
         query_cudagraph_manager=None,
         dp_size=1,
@@ -113,10 +118,26 @@ def _run_prepare(
         num_speculative_steps=num_speculative_steps,
         max_num_reqs=max_num_reqs,
         max_num_tokens=max_num_tokens,
-        max_model_len=128,
+        max_model_len=max(128, target_positions[-1] + 4),
         sample_from_anchor=True,
     )
+    def prepare_with_warmup(*args, **kwargs):
+        if warmup:
+            prepare_dflash_inputs(*args, **kwargs, warmup=True)
+            cache = _prepare_dflash_inputs_kernel.device_caches[
+                torch.cuda.current_device()
+            ][0]
+            cache_keys = set(cache)
+            assert all(compiled.module is not None for compiled in cache.values())
+        prepare_dflash_inputs(*args, **kwargs)
+        if warmup:
+            assert set(cache) == cache_keys
+
     with (
+        patch(
+            "vllm.v1.worker.gpu.spec_decode.dflash.speculator.prepare_dflash_inputs",
+            side_effect=prepare_with_warmup,
+        ),
         patch(
             "vllm.v1.worker.gpu.spec_decode.dflash.speculator.dispatch_cg_and_sync_dp",
             side_effect=InputsPrepared,
@@ -149,6 +170,17 @@ def _run_prepare(
         temperature=temperature.cpu(),
         seeds=seeds.cpu(),
     )
+
+
+def test_dflash_warmup_loads_long_prefill_module_before_first_launch():
+    out = _run_prepare(
+        target_positions=list(range(256)),
+        block_table_values=list(range(1, 129)),
+        warmup=True,
+    )
+    assert out.input_buffers.positions[:3].cpu().tolist() == [254, 255, 256]
+    assert out.sample_pos[:3].tolist() == [255, 256, 257]
+    assert out.context_slot_mapping[254:256].tolist() == [PAD_SLOT_ID, PAD_SLOT_ID]
 
 
 @pytest.mark.parametrize("cp_rank,cp_size", [(0, 1), (0, 2), (1, 2)])
