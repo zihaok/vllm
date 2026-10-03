@@ -121,6 +121,7 @@ def _run_prepare(
         max_model_len=max(128, target_positions[-1] + 4),
         sample_from_anchor=True,
     )
+
     def prepare_with_warmup(*args, **kwargs):
         if warmup:
             prepare_dflash_inputs(*args, **kwargs, warmup=True)

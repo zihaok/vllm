@@ -117,7 +117,8 @@ def test_no_replay_batch_runs_the_whole_batch():
 
 @pytest.mark.parametrize("dp_size", [1, 4])
 @pytest.mark.parametrize(
-    "moe_backend", ["flashinfer_trtllm", "flashinfer_cutedsl", *sorted(MEGA_MOE_BACKENDS)]
+    "moe_backend",
+    ["flashinfer_trtllm", "flashinfer_cutedsl", *sorted(MEGA_MOE_BACKENDS)],
 )
 def test_graph_replay_only_uses_independent_dp_transport(
     monkeypatch, dp_size, moe_backend

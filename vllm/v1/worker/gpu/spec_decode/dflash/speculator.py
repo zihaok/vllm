@@ -252,7 +252,9 @@ class DFlashSpeculator(DraftModelSpeculator):
             1, self.max_num_tokens, self.target_input_buffers
         )
         counts = torch.zeros(self.max_num_reqs, dtype=torch.int32, device=self.device)
-        token_ids = torch.zeros(self.max_num_reqs, dtype=torch.int64, device=self.device)
+        token_ids = torch.zeros(
+            self.max_num_reqs, dtype=torch.int64, device=self.device
+        )
         torch.accelerator.synchronize()
         for i, gid in enumerate(self.draft_kv_cache_group_ids):
             prepare_dflash_inputs(
