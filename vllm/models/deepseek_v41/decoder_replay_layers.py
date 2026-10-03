@@ -27,7 +27,8 @@ from vllm.compilation.breakable_cudagraph import (
     BreakableCUDAGraphCapture,
     BreakableCUDAGraphWrapper,
 )
-from vllm.config import CUDAGraphMode
+from vllm.config import CUDAGraphMode, VllmConfig
+from vllm.config.kernel import MEGA_MOE_BACKENDS
 from vllm.forward_context import (
     ForwardContext,
     get_forward_context,
@@ -49,6 +50,7 @@ class DecoderReplayLayers:
 
     def __init__(
         self,
+        vllm_config: VllmConfig,
         window: int,
         run_layers: Callable[..., tuple[torch.Tensor, ...]],
         row_buffers: list[torch.Tensor],
@@ -64,7 +66,11 @@ class DecoderReplayLayers:
         # Graph seam (piecewise steps). The model state sets, every piecewise
         # step, the replay batch's forward context built on persistent buffers
         # and its real / graph token counts; rows stays None when nothing trims.
-        self.graph_enabled = envs.VLLM_DSV41_GRAPH_BOUNDED_REPLAY
+        # Standard MoE graphs require the batch's agreed DP token counts.
+        self.graph_enabled = envs.VLLM_DSV41_GRAPH_BOUNDED_REPLAY and (
+            vllm_config.parallel_config.data_parallel_size == 1
+            or vllm_config.kernel_config.moe_backend in MEGA_MOE_BACKENDS
+        )
         self.max_num_tokens = 0
         self.graph_forward_context: ForwardContext | None = None
         self.graph_num_tokens = 0

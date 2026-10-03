@@ -11,6 +11,8 @@ import pytest
 import torch
 
 from vllm.config import CUDAGraphMode
+from vllm.distributed.device_communicators.all2all import AgRsAll2AllManager
+from vllm.forward_context import override_forward_context
 from vllm.models.deepseek_v41.nvidia.model_state import DeepseekV41ModelState
 from vllm.v1.worker.gpu.input_batch import InputBatch, InputBuffers
 from vllm.v1.worker.gpu.model_states.default import DefaultModelState
@@ -57,7 +59,9 @@ def state(monkeypatch):
     cfg.scheduler_config.max_num_batched_tokens = 1024
     cfg.parallel_config.data_parallel_size = 1
     cfg.compilation_config.fast_moe_cold_start = False
-    layers = SimpleNamespace(window=WINDOW, rows=None, forward_context=None)
+    layers = SimpleNamespace(
+        window=WINDOW, rows=None, forward_context=None, graph_enabled=False
+    )
     model = SimpleNamespace(token_lookback_depth=0, decoder_replay_layers=layers)
     builds: list = []
 
@@ -257,3 +261,29 @@ def test_idle_dp_rank_dummy_trims_with_its_peers(dp_state):
     assert replay is not None and replay.rows.shape[0] == WINDOW
     dp_metadata = replay.forward_context.dp_metadata
     assert dp_metadata.num_tokens_across_dp_cpu.tolist() == [WINDOW, 129]
+
+
+def test_eager_replay_agrs_uses_each_ranks_trimmed_count(dp_state):
+    """The replay context passes each rank's actual row count to dispatch."""
+    dp_state.other = (True, 300)
+    batch = _input_batch(QUERY_LENS, SEQ_LENS, PREFILLING)
+    replay, _ = _prepare(dp_state, batch, CUDAGraphMode.NONE)
+    metadata = replay.forward_context.dp_metadata
+    manager = object.__new__(AgRsAll2AllManager)
+    manager.dp_world_size = 2
+    group = SimpleNamespace(world_size=2)
+    with override_forward_context(replay.forward_context), metadata.sp_local_sizes(1):
+        sizes = manager._get_sizes(replay.rows.numel(), group)
+    assert sizes == [len(REPLAY_ROWS), 300]
+    assert sizes[0] == replay.rows.numel()
+
+
+def test_standard_dp_piecewise_keeps_full_replay_layer_batch(dp_state):
+    """Disabling the seam leaves graph rows and their DP counts untouched."""
+    dp_state.other = (True, 300)
+    batch = _input_batch(QUERY_LENS, SEQ_LENS, PREFILLING, num_tokens_after_padding=512)
+    replay, build = _prepare(dp_state, batch, CUDAGraphMode.PIECEWISE)
+    assert replay is None and build is None
+    assert dp_state.decoder_replay_layers.graph_forward_context is None
+    assert len(dp_state.builds) == 1
+    assert dp_state.builds[0].batch is batch

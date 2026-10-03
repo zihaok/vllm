@@ -760,6 +760,7 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
         ):
             self.decoder_replay_start = cut + 1
             self.decoder_replay_layers = DecoderReplayLayers(
+                vllm_config,
                 config.sliding_window,
                 self._run_replay_layers,
                 [

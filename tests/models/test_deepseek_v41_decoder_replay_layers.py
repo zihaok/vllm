@@ -2,9 +2,13 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """DecoderReplayLayers runs the replay layers on the forward's replay batch."""
 
+from types import SimpleNamespace
+
 import pytest
 import torch
 
+import vllm.envs as envs
+from vllm.config.kernel import MEGA_MOE_BACKENDS
 from vllm.forward_context import (
     ForwardContext,
     get_forward_context,
@@ -20,6 +24,13 @@ HC, HIDDEN = 2, 3
 # decode (1 token), trimmed prefill (300 of 300), untrimmed prefill (100 of 300)
 WINDOW = 128
 REPLAY_ROWS = [0, *range(301 - WINDOW, 301), *range(301, 401)]
+
+
+def _config(dp_size=1, moe_backend="deep_gemm_mega_moe"):
+    return SimpleNamespace(
+        parallel_config=SimpleNamespace(data_parallel_size=dp_size),
+        kernel_config=SimpleNamespace(moe_backend=moe_backend),
+    )
 
 
 def _context(metadata):
@@ -69,7 +80,7 @@ def test_run_gathers_states_and_realigns_shared_indexer_buffers():
         seen["is_padding"] = replay_context.is_padding
         return residual, pre_mix
 
-    layers = DecoderReplayLayers(WINDOW, run_layers, [topk, candidates])
+    layers = DecoderReplayLayers(_config(), WINDOW, run_layers, [topk, candidates])
     states = _states(NUM_TOKENS)
     hidden, residual = states[0], states[-1]
     full, sub = object(), object()
@@ -96,9 +107,48 @@ def test_no_replay_batch_runs_the_whole_batch():
         seen["attn_metadata"] = get_forward_context().attn_metadata
         return (hidden_states,)
 
-    layers = DecoderReplayLayers(WINDOW, run_layers, [])
+    layers = DecoderReplayLayers(_config(), WINDOW, run_layers, [])
     states = _states(NUM_TOKENS)
     full = object()
     with override_forward_context(_context(full)):
         (output,) = layers(*states)
     assert output is states[0] and seen["attn_metadata"] is full
+
+
+@pytest.mark.parametrize("dp_size", [1, 4])
+@pytest.mark.parametrize(
+    "moe_backend", ["flashinfer_trtllm", "flashinfer_cutedsl", *sorted(MEGA_MOE_BACKENDS)]
+)
+def test_graph_replay_only_uses_independent_dp_transport(
+    monkeypatch, dp_size, moe_backend
+):
+    """AGRS requires a common batch size; Mega's one-sided transport does not."""
+    monkeypatch.setattr(envs, "VLLM_DSV41_GRAPH_BOUNDED_REPLAY", True)
+    layers = DecoderReplayLayers(
+        _config(dp_size, moe_backend), WINDOW, lambda x: (x,), []
+    )
+    expected = dp_size == 1 or moe_backend in MEGA_MOE_BACKENDS
+    assert layers.graph_enabled == expected
+
+
+def test_standard_dp_disables_only_graph_seam(monkeypatch):
+    """Eager replay still gathers/scatters trailing rows with its own context."""
+    monkeypatch.setattr(envs, "VLLM_DSV41_GRAPH_BOUNDED_REPLAY", True)
+    seen = {}
+
+    def run_layers(hidden, *rest):
+        seen["context"] = get_forward_context()
+        return (hidden + 1,)
+
+    layers = DecoderReplayLayers(
+        _config(4, "flashinfer_trtllm"), WINDOW, run_layers, []
+    )
+    _set_replay_batch(layers, REPLAY_ROWS, object())
+    states = _states(NUM_TOKENS)
+    with override_forward_context(_context(object())):
+        (output,) = layers(*states)
+    assert not layers.graph_enabled
+    assert seen["context"] is layers.forward_context
+    rows = layers.rows
+    assert torch.equal(output[rows], states[0][rows] + 1)
+    assert output[1:173].count_nonzero() == 0
