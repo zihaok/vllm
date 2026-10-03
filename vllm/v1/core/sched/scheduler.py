@@ -1956,6 +1956,9 @@ class Scheduler(SchedulerInterface):
         num_computed_tokens: list[int] = []
         num_output_tokens: list[int] = []
         resumed_req_ids = set()
+        # Shared result for steps that allocated no new block (most decode
+        # steps): get_block_ids(allow_none=True) returns None for it.
+        empty_blocks = self.kv_cache_manager.empty_kv_cache_blocks
 
         num_running_reqs = len(running_reqs)
         for idx, req in enumerate(itertools.chain(running_reqs, resumed_reqs)):
@@ -1982,8 +1985,11 @@ class Scheduler(SchedulerInterface):
             if not self.use_v2_model_runner:  # noqa: SIM102
                 if req_id not in self.prev_step_scheduled_req_ids:
                     all_token_ids[req_id] = req.all_token_ids.copy()
+            new_blocks = req_to_new_blocks[req_id]
             new_block_ids.append(
-                req_to_new_blocks[req_id].get_block_ids(allow_none=True)
+                None
+                if new_blocks is empty_blocks
+                else new_blocks.get_block_ids(allow_none=True)
             )
             num_computed_tokens.append(req.num_computed_tokens)
             num_output_tokens.append(

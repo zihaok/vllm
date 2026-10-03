@@ -107,9 +107,9 @@ class KVCacheBlocks:
             if group_ids is None
             else tuple(self.blocks[group_id] for group_id in group_ids)
         )
-        if allow_none and all(len(group) == 0 for group in groups):
+        if allow_none and not any(groups):
             return None
-        return tuple([blk.block_id for blk in group] for group in groups)
+        return tuple([[blk.block_id for blk in group] for group in groups])
 
     def get_block_ids_after_null_head(
         self,
