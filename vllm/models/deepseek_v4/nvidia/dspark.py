@@ -47,6 +47,7 @@ from vllm.model_executor.models.qwen3_dspark import (
     DSparkMarkovHead,
 )
 from vllm.model_executor.models.utils import extract_layer_index, maybe_prefix
+from vllm.models.common.ops.row_copy import broadcast_rows
 from vllm.models.common.ops.sequence_parallel import (
     sp_all_gather,
     sp_padding_mask,
@@ -254,7 +255,7 @@ class DSparkDeepseekV4Model(nn.Module):
                 else None,
             )
         # Expand to hc_mult copies for hyper-connections ([T, H] -> [T, hc, H]).
-        hidden_states = inputs_embeds.unsqueeze(-2).repeat(1, self.hc_mult, 1)
+        hidden_states = broadcast_rows(inputs_embeds, self.hc_mult)
 
         residual = post_mix = res_mix = None
         for layer in self.layers:
