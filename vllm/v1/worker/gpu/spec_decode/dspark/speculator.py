@@ -245,9 +245,20 @@ class DSparkSpeculator(DFlashSpeculator):
         # Per-(req, position) head hidden, ordered (req, step).
         sample_hidden = head_hidden[self.sample_indices[:num_sample]]
         # Draft-vocab logits; sampled ids are remapped to target vocab below.
-        base_logits = self.model.compute_draft_logits(sample_hidden)
+        # Computed step-major so each step's [num_reqs, vocab] slice is contiguous
+        # and the per-step Markov-bias add in _sample_markov_chain runs vectorized.
+        # With (req, step) rows, base_logits[:, i] was a strided view and the add
+        # ran PyTorch's generic elementwise kernel (~190 us per step at C2048 on
+        # Rubin). The LM head computes every row independently, so the logits are
+        # unchanged; the (req, step) view below only permutes strides.
+        step_major_hidden = (
+            sample_hidden.view(num_reqs, n_spec, -1)
+            .transpose(0, 1)
+            .reshape(num_sample, -1)
+        )
+        base_logits = self.model.compute_draft_logits(step_major_hidden)
         vocab_size = base_logits.shape[-1]
-        base_logits = base_logits.view(num_reqs, n_spec, vocab_size)
+        base_logits = base_logits.view(n_spec, num_reqs, vocab_size).transpose(0, 1)
 
         # Anchor (bonus) token per request = the input id at query offset 0,
         # read via the precomputed persistent index (fixed buffer for capture).
