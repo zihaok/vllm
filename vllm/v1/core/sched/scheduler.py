@@ -2783,20 +2783,40 @@ class Scheduler(SchedulerInterface):
         output_token_ids = request._output_token_ids
         all_token_ids = request._all_token_ids
         max_model_len = self.max_model_len
-        for num_new, output_token_id in enumerate(new_token_ids, 1):
-            output_token_ids.append(output_token_id)
-            all_token_ids.append(output_token_id)
+        sampling_params = request.sampling_params
+        if (
+            sampling_params is not None
+            and not request.pooling_params
+            and sampling_params.repetition_detection is None
+            and len(all_token_ids) + num_new_tokens < max_model_len
+            and len(output_token_ids) + num_new_tokens < request.max_tokens
+            and sampling_params.eos_token_id not in new_token_ids
+            and not (
+                (stop_token_ids := sampling_params.stop_token_ids)
+                and any(map(stop_token_ids.__contains__, new_token_ids))
+            )
+        ):
+            # Common case: no token is a stop token and no length limit is
+            # reached even after the last one, so check_stop would return
+            # False, without side effects, after every token.
+            output_token_ids.extend(new_token_ids)
+            all_token_ids.extend(new_token_ids)
+        else:
+            for num_new, output_token_id in enumerate(new_token_ids, 1):
+                output_token_ids.append(output_token_id)
+                all_token_ids.append(output_token_id)
 
-            # Check for stop and update request state.
-            # This must be called before we make the EngineCoreOutput.
-            stopped = check_stop(request, max_model_len)
-            if stopped:
-                # num_computed_tokens covers all new tokens but the last one.
-                # Keep that true after trimming: resumable requests resume from it.
-                if not is_stale:
-                    request.num_computed_tokens -= len(new_token_ids) - num_new
-                del new_token_ids[num_new:]  # Trim new tokens if needed.
-                break
+                # Check for stop and update request state.
+                # This must be called before we make the EngineCoreOutput.
+                stopped = check_stop(request, max_model_len)
+                if stopped:
+                    # num_computed_tokens covers all new tokens but the last one.
+                    # Keep that true after trimming: resumable requests resume
+                    # from it.
+                    if not is_stale:
+                        request.num_computed_tokens -= len(new_token_ids) - num_new
+                    del new_token_ids[num_new:]  # Trim new tokens if needed.
+                    break
         if new_token_ids:
             request.update_block_hashes()
 
