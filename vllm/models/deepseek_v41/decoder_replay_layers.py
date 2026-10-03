@@ -26,6 +26,7 @@ from vllm.forward_context import (
     override_forward_context,
 )
 from vllm.model_executor.layers.fused_moe.moe_output import MoEOutput
+from vllm.models.common.ops.row_copy import index_copy_rows_
 
 
 @dataclass
@@ -139,8 +140,8 @@ class DecoderReplayLayers:
         # The trimmed rows' outputs stay zero; nothing reads them.
         num_tokens = hidden_states.shape[0]
         return tuple(
-            out.new_zeros((num_tokens, *out.shape[1:])).index_copy_(
-                0, rows, out[: rows.numel()]
+            index_copy_rows_(
+                out.new_zeros((num_tokens, *out.shape[1:])), rows, out[: rows.numel()]
             )
             for out in row_outputs
         )
