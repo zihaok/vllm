@@ -526,3 +526,38 @@ def test_logits_cache_narrower_than_logits_is_rejected():
             logits_cache=cache,
             logits_cache_col=torch.tensor(0, dtype=torch.int32, device=DEVICE),
         )
+
+
+@pytest.mark.parametrize("per_token_col", [False, True])
+@pytest.mark.parametrize("is_drafting", [False, True])
+def test_screened_sampling_preserves_speculative_step_seed(per_token_col, is_drafting):
+    """Screening and exact sampling use the same noise for each cached draft step."""
+    rows, vocab, steps = 33, 4099, 4
+    generator = torch.Generator(device=DEVICE).manual_seed(31)
+    logits = torch.randn(rows, vocab, device=DEVICE, generator=generator)
+    mapping = torch.arange(rows, dtype=torch.int32, device=DEVICE)
+    temperature = torch.linspace(0, 1.5, rows, device=DEVICE)
+    seeds = torch.arange(rows, dtype=torch.int64, device=DEVICE) + 137
+    positions = torch.arange(rows, dtype=torch.int64, device=DEVICE) + 13
+    cols = (
+        mapping % steps
+        if per_token_col
+        else torch.tensor(2, dtype=torch.int32, device=DEVICE)
+    )
+    cache = torch.zeros(rows, steps, vocab, device=DEVICE)
+    reference_cache = torch.zeros_like(cache)
+    args = (logits, mapping, temperature, seeds, positions)
+    kwargs = dict(
+        apply_temperature=True,
+        is_drafting=is_drafting,
+        logits_cache_col=cols,
+    )
+    actual = gumbel_sample(*args, logits_cache=cache, **kwargs)
+    expected = gumbel_sample(
+        *args,
+        logits_cache=reference_cache,
+        logits_cache_source=logits,
+        **kwargs,
+    )
+    assert torch.equal(actual, expected)
+    assert torch.equal(cache, reference_cache)

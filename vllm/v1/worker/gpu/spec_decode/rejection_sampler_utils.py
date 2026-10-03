@@ -2,9 +2,15 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import torch
 
+from vllm.platforms import current_platform
 from vllm.triton_utils import tl, tldevice, triton
 from vllm.v1.worker.gpu.sample.gumbel import (
+    _APPROX_GUMBEL_ERR,
+    _approx_gumbel_noise32,
+    _uniform32_from_random,
     gumbel_block_argmax,
+    gumbel_noise32,
+    murmur3_hash32,
     spec_step_seed,
     tl_rand32,
 )
@@ -1017,6 +1023,469 @@ def _insert_resampled_kernel(
     )
 
 
+# Max |_approx_log1p_neg(r) - tldevice.log1p(-r)| over every fp32 r in
+# [0, 1), with margin; checked exhaustively by kernels/sampler/bench
+# (test_rejection.py --suite bound), which requires the measured maximum to be
+# at most a quarter of this.
+_APPROX_LOG1P_ERR = tl.constexpr(1e-4)
+
+
+@triton.jit
+def _approx_log1p_neg(r):
+    """Cheap approximation of log1p(-r) for 0 <= r < 1 (see _APPROX_LOG1P_ERR).
+
+    A 3-term series for small r, the MUFU lg2 of 1 - r otherwise.
+    """
+    series = -r * (1.0 + r * (0.5 + r * 0.3333333432674408))
+    direct = tldevice.fast_log2f(1.0 - r) * 0.6931471805599453
+    return tl.where(r < 0.015625, series, direct)
+
+
+@triton.jit
+def _resample_row_context(
+    req_idx,
+    rejected_step_ptr,
+    cu_num_logits_ptr,
+    expanded_idx_mapping_ptr,
+    draft_sampled_ptr,
+    temp_ptr,
+    seed_ptr,
+    pos_ptr,
+    target_rejected_logsumexp_ptr,
+    draft_rejected_logsumexp_ptr,
+    cumulative_log_p_ptr,
+    HAS_DRAFT_LOGITS: tl.constexpr,
+    USE_BLOCK_VERIFICATION: tl.constexpr,
+):
+    """Per-request scalars of _resample_kernel, loaded the same way."""
+    resample_idx = tl.load(rejected_step_ptr + req_idx)
+    start_idx = tl.load(cu_num_logits_ptr + req_idx).to(tl.int64)
+    end_idx = tl.load(cu_num_logits_ptr + req_idx + 1)
+    resample_token_idx = start_idx + resample_idx
+    req_state_idx = tl.load(expanded_idx_mapping_ptr + resample_token_idx).to(tl.int64)
+    temp = tl.load(temp_ptr + req_state_idx).to(tl.float32)
+    is_bonus = resample_token_idx == end_idx - 1
+    rejected_draft_token = tl.load(
+        draft_sampled_ptr + resample_token_idx + 1,
+        mask=not is_bonus,
+        other=0,
+    )
+    use_target = is_bonus or not (rejected_draft_token >= 0)
+    # gumbel_block_argmax's per-row noise state (temperature is not applied:
+    # the target logits already carry it).
+    is_valid_req = req_state_idx >= 0
+    noise_temp = tl.load(temp_ptr + req_state_idx, mask=is_valid_req, other=0.0).to(
+        tl.float32
+    )
+    seed = tl.load(seed_ptr + req_state_idx, mask=is_valid_req, other=0)
+    pos = tl.load(pos_ptr + resample_token_idx)
+    target_lse = 0.0
+    draft_lse = 0.0
+    log_p_tau = 0.0
+    if HAS_DRAFT_LOGITS:
+        target_lse = tl.load(target_rejected_logsumexp_ptr + req_idx)
+        draft_lse = tl.load(draft_rejected_logsumexp_ptr + req_idx)
+        if USE_BLOCK_VERIFICATION:  # noqa: SIM102 (constexpr, then runtime)
+            if resample_idx > 0:
+                log_p_tau = tl.load(cumulative_log_p_ptr + resample_token_idx - 1).to(
+                    tl.float32
+                )
+    return (
+        resample_idx,
+        resample_token_idx,
+        req_state_idx,
+        temp,
+        is_bonus,
+        rejected_draft_token,
+        use_target,
+        noise_temp,
+        seed,
+        pos,
+        target_lse,
+        draft_lse,
+        log_p_tau,
+    )
+
+
+@triton.jit
+def _resample_residual(
+    token,
+    mask,
+    target_row_ptr,
+    draft_row_ptr,
+    temp,
+    rejected_draft_token,
+    use_target,
+    target_lse,
+    draft_lse,
+    log_p_tau,
+    resample_idx,
+    APPROX: tl.constexpr,
+    HAS_DRAFT_LOGITS: tl.constexpr,
+    USE_BLOCK_VERIFICATION: tl.constexpr,
+):
+    """_resample_kernel's residual logits at `token` (exact unless APPROX)."""
+    target_logits = tl.load(target_row_ptr + token, mask=mask, other=float("-inf")).to(
+        tl.float32
+    )
+    if use_target:
+        residual_logits = target_logits
+    elif HAS_DRAFT_LOGITS:
+        draft_logits = (
+            tl.load(draft_row_ptr + token, mask=mask, other=float("-inf")).to(
+                tl.float32
+            )
+            / temp
+        )
+        target_log_probs = target_logits - target_lse
+        if USE_BLOCK_VERIFICATION:
+            # log_p_tau is 0.0 when nothing was accepted, as in _resample_kernel.
+            target_log_probs += log_p_tau
+        draft_log_probs = draft_logits - draft_lse
+        ratio = tl.exp(draft_log_probs - target_log_probs)
+        if APPROX:  # noqa: SIM108
+            log1p_neg = _approx_log1p_neg(ratio)
+        else:
+            log1p_neg = tldevice.log1p(-ratio)
+        residual_logits = tl.where(
+            ratio < 1.0,
+            target_log_probs + log1p_neg,
+            float("-inf"),
+        ).to(tl.float32)
+    else:
+        residual_logits = tl.where(
+            token != rejected_draft_token,
+            target_logits,
+            float("-inf"),
+        ).to(tl.float32)
+    return residual_logits
+
+
+@triton.jit
+def _resample_screen_kernel(
+    # [num_reqs, num_blocks]
+    local_value_ptr,
+    local_token_ptr,
+    local_pending_ptr,
+    local_stride,
+    # [num_logits, V]
+    target_logits_ptr,
+    target_logits_stride,
+    # [num_reqs]
+    target_rejected_logsumexp_ptr,
+    # [max_num_reqs, num_speculative_steps, V]
+    draft_logits_ptr,
+    draft_logits_stride_0,
+    draft_logits_stride_1,
+    # [num_reqs]
+    draft_rejected_logsumexp_ptr,
+    # [num_reqs]
+    rejected_step_ptr,
+    # [num_reqs + 1]
+    cu_num_logits_ptr,
+    # [num_logits]
+    expanded_idx_mapping_ptr,
+    # [num_logits]
+    draft_sampled_ptr,
+    # [max_num_reqs]
+    temp_ptr,
+    # [max_num_reqs]
+    seed_ptr,
+    # [num_logits]
+    pos_ptr,
+    # [num_logits]
+    cumulative_log_p_ptr,
+    vocab_size,
+    BLOCK_SIZE: tl.constexpr,
+    HAS_DRAFT_LOGITS: tl.constexpr,
+    USE_BLOCK_VERIFICATION: tl.constexpr,
+    MAX_CANDIDATES: tl.constexpr,
+):
+    """Per-block (max, lowest argmax) of _resample_kernel's noised residual
+    logits, screened like _gumbel_screen_kernel: every token gets an
+    approximation (approximate log1p and Gumbel noise, each with a proven
+    error bound), only tokens within the combined tolerance of the block's
+    approximate max can hold the exact max, and those are recomputed with
+    _resample_kernel's exact arithmetic (here, or in _resample_finalize_kernel
+    when there is exactly one).
+    """
+    req_idx = tl.program_id(0)
+    (
+        resample_idx,
+        resample_token_idx,
+        req_state_idx,
+        temp,
+        is_bonus,
+        rejected_draft_token,
+        use_target,
+        noise_temp,
+        seed,
+        pos,
+        target_lse,
+        draft_lse,
+        log_p_tau,
+    ) = _resample_row_context(
+        req_idx,
+        rejected_step_ptr,
+        cu_num_logits_ptr,
+        expanded_idx_mapping_ptr,
+        draft_sampled_ptr,
+        temp_ptr,
+        seed_ptr,
+        pos_ptr,
+        target_rejected_logsumexp_ptr,
+        draft_rejected_logsumexp_ptr,
+        cumulative_log_p_ptr,
+        HAS_DRAFT_LOGITS=HAS_DRAFT_LOGITS,
+        USE_BLOCK_VERIFICATION=USE_BLOCK_VERIFICATION,
+    )
+    if temp == 0.0 and not is_bonus:
+        # Greedy + non-bonus token. No resampling needed because
+        # the target argmax is already in the sampled tensor.
+        return
+
+    block_idx = tl.program_id(1)
+    block = block_idx * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+    mask = block < vocab_size
+    target_row_ptr = target_logits_ptr + resample_token_idx * target_logits_stride
+    if HAS_DRAFT_LOGITS:
+        draft_row_ptr = (
+            draft_logits_ptr
+            + req_state_idx * draft_logits_stride_0
+            + resample_idx * draft_logits_stride_1
+        )
+    else:
+        draft_row_ptr = target_row_ptr  # unused (one-hot draft)
+    pending = 0
+    if noise_temp == 0.0:
+        residual = _resample_residual(
+            block,
+            mask,
+            target_row_ptr,
+            draft_row_ptr,
+            temp,
+            rejected_draft_token,
+            use_target,
+            target_lse,
+            draft_lse,
+            log_p_tau,
+            resample_idx,
+            APPROX=False,
+            HAS_DRAFT_LOGITS=HAS_DRAFT_LOGITS,
+            USE_BLOCK_VERIFICATION=USE_BLOCK_VERIFICATION,
+        )
+        value, idx = tl.max(residual, axis=0, return_indices=True)
+    else:
+        approx_residual = _resample_residual(
+            block,
+            mask,
+            target_row_ptr,
+            draft_row_ptr,
+            temp,
+            rejected_draft_token,
+            use_target,
+            target_lse,
+            draft_lse,
+            log_p_tau,
+            resample_idx,
+            APPROX=True,
+            HAS_DRAFT_LOGITS=HAS_DRAFT_LOGITS,
+            USE_BLOCK_VERIFICATION=USE_BLOCK_VERIFICATION,
+        )
+        if tl.max(approx_residual, axis=0) == float("-inf"):
+            # The approximate residual is -inf exactly where the exact one is
+            # (same ratio test, finite log1p otherwise), so the whole block is
+            # -inf after noise too: _resample_kernel's tl.max gives (-inf, 0).
+            # Top-p leaves most target blocks like this.
+            value = -float("inf")
+            idx = 0
+        else:
+            u = _uniform32_from_random(murmur3_hash32(seed, pos, block))
+            # Masked lanes and zero residual mass are -inf here and exactly.
+            approx = approx_residual + _approx_gumbel_noise32(u)
+            approx_max, approx_idx = tl.max(approx, axis=0, return_indices=True)
+            tol = (
+                2.5 * (_APPROX_GUMBEL_ERR + _APPROX_LOG1P_ERR)
+                + (tl.abs(approx_max) + 32.0) * 9.5367431640625e-07
+            )
+            candidates = ~(approx < approx_max - tol)
+            num_candidates = tl.sum(candidates.to(tl.int32))
+            finite = tl.abs(approx_max) < 3.0e38
+            if (num_candidates == 1) & finite:
+                value = approx_max
+                idx = approx_idx
+                pending = 1
+            elif (num_candidates <= MAX_CANDIDATES) & finite:
+                value = -float("inf")
+                idx = 0
+                prev = -1
+                for _ in range(num_candidates):
+                    token_id = tl.min(
+                        tl.where(candidates & (block > prev), block, 2147483647)
+                    )
+                    r = _resample_residual(
+                        token_id,
+                        True,
+                        target_row_ptr,
+                        draft_row_ptr,
+                        temp,
+                        rejected_draft_token,
+                        use_target,
+                        target_lse,
+                        draft_lse,
+                        log_p_tau,
+                        resample_idx,
+                        APPROX=False,
+                        HAS_DRAFT_LOGITS=HAS_DRAFT_LOGITS,
+                        USE_BLOCK_VERIFICATION=USE_BLOCK_VERIFICATION,
+                    )
+                    v = r + gumbel_noise32(
+                        _uniform32_from_random(murmur3_hash32(seed, pos, token_id))
+                    )
+                    if v > value:
+                        value = v
+                        idx = token_id - block_idx * BLOCK_SIZE
+                    prev = token_id
+            else:
+                residual = _resample_residual(
+                    block,
+                    mask,
+                    target_row_ptr,
+                    draft_row_ptr,
+                    temp,
+                    rejected_draft_token,
+                    use_target,
+                    target_lse,
+                    draft_lse,
+                    log_p_tau,
+                    resample_idx,
+                    APPROX=False,
+                    HAS_DRAFT_LOGITS=HAS_DRAFT_LOGITS,
+                    USE_BLOCK_VERIFICATION=USE_BLOCK_VERIFICATION,
+                )
+                exact = tl.where(mask, residual + gumbel_noise32(u), float("-inf"))
+                value, idx = tl.max(exact, axis=0, return_indices=True)
+    out = req_idx * local_stride + block_idx
+    tl.store(local_value_ptr + out, value)
+    tl.store(local_token_ptr + out, block_idx * BLOCK_SIZE + idx)
+    tl.store(local_pending_ptr + out, pending)
+
+
+@triton.jit
+def _resample_finalize_kernel(
+    # [num_reqs, num_speculative_steps + 1]
+    sampled_ptr,
+    sampled_stride,
+    # [num_reqs]
+    num_sampled_ptr,
+    local_value_ptr,
+    local_token_ptr,
+    local_pending_ptr,
+    local_stride,
+    num_blocks,
+    target_logits_ptr,
+    target_logits_stride,
+    target_rejected_logsumexp_ptr,
+    draft_logits_ptr,
+    draft_logits_stride_0,
+    draft_logits_stride_1,
+    draft_rejected_logsumexp_ptr,
+    cu_num_logits_ptr,
+    expanded_idx_mapping_ptr,
+    draft_sampled_ptr,
+    temp_ptr,
+    seed_ptr,
+    pos_ptr,
+    cumulative_log_p_ptr,
+    HAS_DRAFT_LOGITS: tl.constexpr,
+    USE_BLOCK_VERIFICATION: tl.constexpr,
+    PADDED_NUM_BLOCKS: tl.constexpr,
+):
+    """_insert_resampled_kernel for _resample_screen_kernel's block results:
+    exact values of the pending blocks, then the lowest-block argmax."""
+    req_idx = tl.program_id(0)
+    (
+        resample_idx,
+        resample_token_idx,
+        req_state_idx,
+        temp,
+        is_bonus,
+        rejected_draft_token,
+        use_target,
+        noise_temp,
+        seed,
+        pos,
+        target_lse,
+        draft_lse,
+        log_p_tau,
+    ) = _resample_row_context(
+        req_idx,
+        num_sampled_ptr,
+        cu_num_logits_ptr,
+        expanded_idx_mapping_ptr,
+        draft_sampled_ptr,
+        temp_ptr,
+        seed_ptr,
+        pos_ptr,
+        target_rejected_logsumexp_ptr,
+        draft_rejected_logsumexp_ptr,
+        cumulative_log_p_ptr,
+        HAS_DRAFT_LOGITS=HAS_DRAFT_LOGITS,
+        USE_BLOCK_VERIFICATION=USE_BLOCK_VERIFICATION,
+    )
+    # Increment the number of sampled tokens.
+    tl.store(num_sampled_ptr + req_idx, resample_idx + 1)
+    if temp == 0.0 and not is_bonus:
+        # Greedy + non-bonus token. The target argmax is already
+        # in the sampled tensor.
+        return
+
+    blocks = tl.arange(0, PADDED_NUM_BLOCKS)
+    bmask = blocks < num_blocks
+    base = req_idx * local_stride
+    value = tl.load(local_value_ptr + base + blocks, mask=bmask, other=-float("inf"))
+    token = tl.load(local_token_ptr + base + blocks, mask=bmask, other=0)
+    pending = tl.load(local_pending_ptr + base + blocks, mask=bmask, other=0) != 0
+    if tl.max(pending.to(tl.int32)) > 0:
+        target_row_ptr = target_logits_ptr + resample_token_idx * target_logits_stride
+        if HAS_DRAFT_LOGITS:
+            draft_row_ptr = (
+                draft_logits_ptr
+                + req_state_idx * draft_logits_stride_0
+                + resample_idx * draft_logits_stride_1
+            )
+        else:
+            draft_row_ptr = target_row_ptr  # unused (one-hot draft)
+        residual = _resample_residual(
+            token,
+            pending,
+            target_row_ptr,
+            draft_row_ptr,
+            temp,
+            rejected_draft_token,
+            use_target,
+            target_lse,
+            draft_lse,
+            log_p_tau,
+            resample_idx,
+            APPROX=False,
+            HAS_DRAFT_LOGITS=HAS_DRAFT_LOGITS,
+            USE_BLOCK_VERIFICATION=USE_BLOCK_VERIFICATION,
+        )
+        exact = residual + gumbel_noise32(
+            _uniform32_from_random(murmur3_hash32(seed, pos, token))
+        )
+        value = tl.where(pending, exact, value)
+    # See _insert_resampled_kernel: NaN breaks tl.argmax index bounds.
+    value = tl.where(value != value, float("-inf"), value)
+    best = tl.argmax(value, axis=0)
+    resampled = tl.sum(tl.where(blocks == best, token, 0))
+    tl.store(sampled_ptr + req_idx * sampled_stride + resample_idx, resampled)
+
+
+_RESAMPLE_SCREEN_BLOCK_SIZE = 1024
+
+
 def rejection_sample(
     # [num_logits, V]
     target_logits: torch.Tensor,
@@ -1141,6 +1610,10 @@ def rejection_sample(
         num_speculative_steps,
         BLOCK_SIZE=VOCAB_BLOCK_SIZE,
         HAS_DRAFT_LOGITS=has_draft_logits,
+        # The kernel is memory-latency bound and register-limited to 5 CTAs
+        # per SM; 80 registers fit 6 (~9% faster on Rubin). Only register
+        # allocation changes, not the arithmetic.
+        **({"maxnreg": 80} if current_platform.is_cuda() else {}),
     )
 
     # Precompute the running joint ratio and residual mass for block
@@ -1268,6 +1741,28 @@ def rejection_sample(
     )
 
     # Resample the rejected/bonus tokens.
+    if not watermark and not use_fp64 and current_platform.is_cuda():
+        _resample_screened(
+            sampled,
+            num_sampled,
+            target_logits,
+            target_rejected_logsumexp,
+            draft_logits,
+            draft_logits_stride_0,
+            draft_logits_stride_1,
+            draft_rejected_logsumexp,
+            cu_num_logits,
+            expanded_idx_mapping,
+            draft_sampled,
+            temperature,
+            seed,
+            pos,
+            cumulative_log_p,
+            vocab_size,
+            has_draft_logits,
+            use_block_verification,
+        )
+        return sampled, num_sampled
     RESAMPLE_BLOCK_SIZE = 1024
     resample_num_blocks = triton.cdiv(vocab_size, RESAMPLE_BLOCK_SIZE)
     padded_resample_num_blocks = triton.next_power_of_2(resample_num_blocks)
@@ -1331,3 +1826,89 @@ def rejection_sample(
         PADDED_RESAMPLE_NUM_BLOCKS=padded_resample_num_blocks,
     )
     return sampled, num_sampled
+
+
+def _resample_screened(
+    sampled: torch.Tensor,
+    num_sampled: torch.Tensor,
+    target_logits: torch.Tensor,
+    target_rejected_logsumexp: torch.Tensor,
+    draft_logits: torch.Tensor | None,
+    draft_logits_stride_0: int,
+    draft_logits_stride_1: int,
+    draft_rejected_logsumexp: torch.Tensor,
+    cu_num_logits: torch.Tensor,
+    expanded_idx_mapping: torch.Tensor,
+    draft_sampled: torch.Tensor,
+    temperature: torch.Tensor,
+    seed: torch.Tensor,
+    pos: torch.Tensor,
+    cumulative_log_p: torch.Tensor | None,
+    vocab_size: int,
+    has_draft_logits: bool,
+    use_block_verification: bool,
+    block_size: int = _RESAMPLE_SCREEN_BLOCK_SIZE,
+    num_warps: int = 4,
+) -> None:
+    """_resample_kernel + _insert_resampled_kernel via the screened kernels;
+    same resampled tokens, same num_sampled update."""
+    num_reqs = cu_num_logits.shape[0] - 1
+    num_blocks = triton.cdiv(vocab_size, block_size)
+    local_value = target_logits.new_empty(num_reqs, num_blocks, dtype=torch.float32)
+    local_token = target_logits.new_empty(num_reqs, num_blocks, dtype=torch.int32)
+    local_pending = target_logits.new_empty(num_reqs, num_blocks, dtype=torch.int8)
+    _resample_screen_kernel[(num_reqs, num_blocks)](
+        local_value,
+        local_token,
+        local_pending,
+        local_value.stride(0),
+        target_logits,
+        target_logits.stride(0),
+        target_rejected_logsumexp,
+        draft_logits,
+        draft_logits_stride_0,
+        draft_logits_stride_1,
+        draft_rejected_logsumexp,
+        num_sampled,
+        cu_num_logits,
+        expanded_idx_mapping,
+        draft_sampled,
+        temperature,
+        seed,
+        pos,
+        cumulative_log_p,
+        vocab_size,
+        BLOCK_SIZE=block_size,
+        HAS_DRAFT_LOGITS=has_draft_logits,
+        USE_BLOCK_VERIFICATION=use_block_verification,
+        MAX_CANDIDATES=16,
+        num_warps=num_warps,
+    )
+    _resample_finalize_kernel[(num_reqs,)](
+        sampled,
+        sampled.stride(0),
+        num_sampled,
+        local_value,
+        local_token,
+        local_pending,
+        local_value.stride(0),
+        num_blocks,
+        target_logits,
+        target_logits.stride(0),
+        target_rejected_logsumexp,
+        draft_logits,
+        draft_logits_stride_0,
+        draft_logits_stride_1,
+        draft_rejected_logsumexp,
+        cu_num_logits,
+        expanded_idx_mapping,
+        draft_sampled,
+        temperature,
+        seed,
+        pos,
+        cumulative_log_p,
+        HAS_DRAFT_LOGITS=has_draft_logits,
+        USE_BLOCK_VERIFICATION=use_block_verification,
+        PADDED_NUM_BLOCKS=triton.next_power_of_2(num_blocks),
+        num_warps=1,
+    )

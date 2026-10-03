@@ -119,7 +119,19 @@ class DSparkSpeculator(DFlashSpeculator):
         idx_map: torch.Tensor,
         sample_pos: torch.Tensor,
         step: int,
+        logits_bias: torch.Tensor | None = None,
     ) -> torch.Tensor:
+        # `logits_bias` (the Markov bias) is added inside the sampling kernel
+        # when only the Gumbel sampler consumes the logits; anything else that
+        # reads them gets the materialized sum.
+        if logits_bias is not None and (
+            self.acceptance_estimator is not None
+            or self.draft_logits is None
+            or self._d2t_scatter_index is not None
+            or self.draft_watermarker is not None
+        ):
+            logits = logits + logits_bias
+            logits_bias = None
         self._maybe_predict_acceptance(logits, idx_map, self._step_cols[step])
         if self.draft_logits is None:
             draft_ids = logits.argmax(dim=-1)
@@ -135,12 +147,20 @@ class DSparkSpeculator(DFlashSpeculator):
 
         # sample_pos is the predicted token's position P. Sampling keys a draw
         # by the position before the sampled token, P-1.
-        sampler = (
-            gumbel_sample
-            if self.draft_watermarker is None
-            else self.draft_watermarker.sample
-        )
-        return sampler(
+        if self.draft_watermarker is not None:
+            return self.draft_watermarker.sample(
+                logits,
+                idx_map,
+                self.temperature,
+                self.seeds,
+                sample_pos - 1,
+                apply_temperature=True,
+                is_drafting=True,
+                logits_cache=self.draft_logits,
+                logits_cache_col=self._step_cols[step],
+                use_fp64=self.use_fp64_gumbel,
+            )
+        return gumbel_sample(
             logits,
             idx_map,
             self.temperature,
@@ -151,6 +171,7 @@ class DSparkSpeculator(DFlashSpeculator):
             logits_cache=self.draft_logits,
             logits_cache_col=self._step_cols[step],
             use_fp64=self.use_fp64_gumbel,
+            logits_bias=logits_bias,
         )
 
     def _sample_sequential(self, num_reqs: int, head_hidden: torch.Tensor) -> None:
@@ -182,9 +203,10 @@ class DSparkSpeculator(DFlashSpeculator):
             if self.use_confidence_head:
                 confidence_markov_embeds.append(markov_embed)
             bias = self.model.markov_bias(markov_embed)
-            logits_i = base_logits[:, i] + bias
+            # The base layout is [request, step, vocab]; pass its per-step
+            # view and fuse the Markov bias in the sampling kernel.
             draft_sampled_i = self._sample_logits(
-                logits_i, idx_map[:, i], sample_pos[:, i], i
+                base_logits[:, i], idx_map[:, i], sample_pos[:, i], i, logits_bias=bias
             )
             self.draft_tokens[:num_reqs, i] = draft_sampled_i
             prev = draft_sampled_i
