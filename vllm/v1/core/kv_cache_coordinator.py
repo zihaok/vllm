@@ -16,6 +16,7 @@ from vllm.v1.core.kv_cache_utils import (
 from vllm.v1.core.single_type_kv_cache_manager import (
     CircularBufferManager,
     CrossAttentionManager,
+    FullAttentionManager,
     MambaManager,
     SingleTypeKVCacheManager,
     SlidingWindowManager,
@@ -131,6 +132,33 @@ def _allocate_new_blocks_plan_entry(
     ):
         return (manager, _ALLOC_RING)
     return (manager, _ALLOC_GENERIC)
+
+
+def _cache_blocks_plan_entry(
+    manager: SingleTypeKVCacheManager,
+) -> tuple[SingleTypeKVCacheManager, bool] | None:
+    """How the coordinator's ``cache_blocks`` handles ``manager``.
+
+    None: the call never does anything (caching disabled, the ring, or the
+    base implementation on a non-prefix-cacheable spec such as SWA under
+    bounded replay). ``(manager, True)``: the base implementation (also full
+    attention when its blocks are hash-sized, so no partial-tail entry), which
+    returns at once unless a block became full since the last call; the
+    coordinator checks that itself. ``(manager, False)``: always call.
+    """
+    if not manager.enable_caching:
+        return None
+    impl = _resolved_impl(manager, "cache_blocks")
+    if impl is CircularBufferManager.cache_blocks:
+        return None
+    if impl is SingleTypeKVCacheManager.cache_blocks or (
+        impl is FullAttentionManager.cache_blocks
+        and manager.block_size == manager.block_pool.hash_block_size
+    ):
+        if not manager.kv_cache_spec.prefix_cacheable:
+            return None
+        return (manager, True)
+    return (manager, False)
 
 
 def _validate_prefix_cache_retention_interval(
@@ -299,6 +327,11 @@ class KVCacheCoordinator(ABC):
         self._allocate_new_blocks_plan = tuple(
             _allocate_new_blocks_plan_entry(manager)
             for manager in self.single_type_managers
+        )
+        self._cache_blocks_plan = tuple(
+            (group_id, *entry)
+            for group_id, manager in enumerate(self.single_type_managers)
+            if (entry := _cache_blocks_plan_entry(manager)) is not None
         )
 
         # A positive retention interval must be a multiple of the base hit granularity
@@ -533,17 +566,27 @@ class KVCacheCoordinator(ABC):
                 (including tokens that are already cached).
 
         """
-        boundaries = replay_boundaries(
-            request.num_prompt_tokens,
-            self.scheduler_block_size,
-            use_eagle=bool(self.drop_eagle_group_ids),
-        )
-        for group_id, manager in enumerate(self.single_type_managers):
-            if not manager.enable_caching:
+        boundaries = None
+        for group_id, manager, skip_if_no_new_full_block in self._cache_blocks_plan:
+            num_tokens_to_cache = self.get_num_cacheable_tokens(
+                num_computed_tokens, group_id
+            )
+            # Most calls (every decode step) complete no new block. The skipped
+            # call would return at once: it caches min(num_tokens, hashed
+            # tokens) // block_size full blocks, never more than this bound.
+            if skip_if_no_new_full_block and manager.num_cached_block.get(
+                request.request_id, 0
+            ) >= (num_tokens_to_cache // manager.block_size):
                 continue
+            if boundaries is None:
+                boundaries = replay_boundaries(
+                    request.num_prompt_tokens,
+                    self.scheduler_block_size,
+                    use_eagle=bool(self.drop_eagle_group_ids),
+                )
             manager.cache_blocks(
                 request,
-                self.get_num_cacheable_tokens(num_computed_tokens, group_id),
+                num_tokens_to_cache,
                 retention_interval=self.retention_interval,
                 replay_boundaries=boundaries,
             )
