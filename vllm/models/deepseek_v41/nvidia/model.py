@@ -72,6 +72,7 @@ from vllm.model_executor.models.utils import (
     make_layers,
     maybe_prefix,
 )
+from vllm.models.common.ops.row_copy import broadcast_rows
 from vllm.models.common.ops.sequence_parallel import (
     sp_all_gather,
     sp_padding_mask,
@@ -528,7 +529,7 @@ class DeepseekV4DecoderLayer(nn.Module):
                 # First layer: the stream is the embedding broadcast to hc
                 # copies and the identity pre-mix selects copy 0.
                 assert self.hc_attn_fn_broadcast is not None
-                residual = x.unsqueeze(1).expand(-1, self.hc_mult, -1).contiguous()
+                residual = broadcast_rows(x, self.hc_mult)
                 post_mix, res_mix, x, attn_pre = mhc_pre(
                     residual,
                     self.hc_attn_fn_broadcast,
