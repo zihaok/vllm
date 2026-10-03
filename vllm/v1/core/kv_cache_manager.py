@@ -4,6 +4,7 @@
 import itertools
 from collections.abc import Sequence
 from dataclasses import dataclass
+from operator import attrgetter
 from typing import Literal, overload
 
 from vllm.distributed.kv_events import BlockStored, KVCacheEvent
@@ -34,6 +35,9 @@ from vllm.v1.metrics.stats import PrefixCacheStats
 from vllm.v1.request import Request, RequestStatus
 
 logger = init_logger(__name__)
+
+# KVCacheBlock.block_hash_num_tokens without the property call.
+_get_block_hash_num_tokens = attrgetter("_block_hash_num_tokens")
 
 
 @dataclass
@@ -849,12 +853,14 @@ class KVCacheManager:
                 # Cross-attention and encoder-only groups are not prefix cached.
                 continue
 
-            group_cached_tokens = 0
-            for block in blocks:
-                group_cached_tokens = max(
-                    group_cached_tokens,
-                    block.block_hash_num_tokens or 0,
-                )
+            # max(0, block.block_hash_num_tokens or 0 for each block), in C.
+            group_cached_tokens = max(
+                0,
+                max(
+                    filter(None, map(_get_block_hash_num_tokens, blocks)),
+                    default=0,
+                ),
+            )
 
             cached_tokens = (
                 group_cached_tokens
