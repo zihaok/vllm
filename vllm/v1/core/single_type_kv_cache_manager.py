@@ -799,12 +799,24 @@ class FullAttentionManager(SingleTypeKVCacheManager):
         )
         # Phase 1: longest run of cached full blocks from the start. A missing
         # block implies every later block misses too (chained hashes).
-        for block_hash in itertools.islice(full_block_hashes, max_length // block_size):
-            cached_block = block_pool.get_cached_block(block_hash, kv_cache_group_ids)
-            if not cached_block:
-                break
-            for computed, cached in zip(computed_blocks, cached_block):
-                computed.append(cached)
+        if len(kv_cache_group_ids) == 1 and isinstance(block_pool, BlockPool):
+            computed_blocks[0].extend(
+                block_pool.get_cached_block_prefix(
+                    itertools.islice(full_block_hashes, max_length // block_size),
+                    kv_cache_group_ids[0],
+                )
+            )
+        else:
+            for block_hash in itertools.islice(
+                full_block_hashes, max_length // block_size
+            ):
+                cached_block = block_pool.get_cached_block(
+                    block_hash, kv_cache_group_ids
+                )
+                if not cached_block:
+                    break
+                for computed, cached in zip(computed_blocks, cached_block):
+                    computed.append(cached)
         hit_length = len(computed_blocks[0]) * block_size
 
         # Phase 2 (fine-grained only): extend into the first non-full block by
