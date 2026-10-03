@@ -675,11 +675,15 @@ class SingleTypeKVCacheManager(ABC):
         last_block = min(last_block, len(blocks))
 
         freed: list[KVCacheBlock] = []
+        null_block = self._null_block
         for i in range(last_block - 1, first_block - 1, -1):
-            if blocks[i] == self._null_block:
+            block = blocks[i]
+            # The identity test is the common stop (an already removed block)
+            # and spares the field-by-field dataclass comparison.
+            if block is null_block or block == null_block:
                 break
-            freed.append(blocks[i])
-            blocks[i] = self._null_block
+            freed.append(block)
+            blocks[i] = null_block
         if freed:
             self.block_pool.free_blocks(freed)
 

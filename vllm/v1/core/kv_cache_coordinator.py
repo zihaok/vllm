@@ -584,16 +584,21 @@ class KVCacheCoordinator(ABC):
                 num_skipped_tokens = processed_computed_tokens - swa_skip_offset
                 if num_skipped_tokens > 0:
                     blocks = req_to_blocks[request_id]
-                    num_skipped_blocks = min(
-                        num_skipped_tokens // block_size, len(blocks)
-                    )
-                    if (
-                        num_skipped_blocks
-                        and blocks[num_skipped_blocks - 1] is not manager._null_block
-                    ):
-                        manager._remove_blocks_in_range(
-                            request_id, 0, num_skipped_blocks
-                        )
+                    j = min(num_skipped_tokens // block_size, len(blocks)) - 1
+                    null_block = manager._null_block
+                    if j >= 0 and blocks[j] is not null_block:
+                        # Inlined _remove_blocks_in_range(request_id, 0, j + 1):
+                        # null out and free back to the first removed block.
+                        freed: list[KVCacheBlock] = []
+                        while j >= 0:
+                            block = blocks[j]
+                            if block is null_block or block == null_block:
+                                break
+                            freed.append(block)
+                            blocks[j] = null_block
+                            j -= 1
+                        if freed:
+                            manager.block_pool.free_blocks(freed)
             # get_num_blocks_to_allocate (see there).
             blocks = req_to_blocks.get(request_id)
             num_req_blocks = 0 if blocks is None else len(blocks)
