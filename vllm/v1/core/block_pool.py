@@ -696,12 +696,22 @@ class BlockPool:
 
         # In order to only iterate the list once, we duplicated code a bit
         if self.enable_caching:
+            metrics_collector = self.metrics_collector
+            hashes_by_block = self.cached_block_hashes_by_block
             for block in ret:
-                self._maybe_evict_cached_block(block)
+                # Eviction has nothing to do for a block that carries no
+                # prefix-cache hash (most reused blocks, e.g. every block a
+                # sliding window released) unless metrics track evictions.
+                if (
+                    metrics_collector
+                    or block._block_hash is not None
+                    or block.block_id in hashes_by_block
+                ):
+                    self._maybe_evict_cached_block(block)
                 assert block.ref_cnt == 0
                 block.ref_cnt += 1
-                if self.metrics_collector:
-                    self.metrics_collector.on_block_allocated(block)
+                if metrics_collector:
+                    metrics_collector.on_block_allocated(block)
         else:
             for block in ret:
                 assert block.ref_cnt == 0
