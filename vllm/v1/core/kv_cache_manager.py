@@ -506,6 +506,24 @@ class KVCacheManager:
                 "computed tokens to adopt"
             )
 
+        if (
+            new_computed_blocks is None
+            and num_new_computed_tokens == 0
+            and num_external_computed_tokens == 0
+            and num_encoder_tokens == 0
+            and not full_sequence_must_fit
+            and not delay_cache_blocks
+            and self.coordinator.supports_allocate_without_new_hits
+        ):
+            # Every running request: no new hits to adopt (see below).
+            return self._allocate_slots_without_new_hits(
+                request,
+                num_new_tokens,
+                num_lookahead_tokens,
+                reserved_blocks,
+                has_scheduled_reqs,
+            )
+
         if new_computed_blocks is not None:
             new_computed_block_list = new_computed_blocks.blocks
             if self.retained_hit_group_ids:
@@ -640,6 +658,48 @@ class KVCacheManager:
         )
         self.coordinator.cache_blocks(request, num_tokens_to_cache)
 
+        return self.create_kv_cache_blocks(new_blocks)
+
+    def _allocate_slots_without_new_hits(
+        self,
+        request: Request,
+        num_new_tokens: int,
+        num_lookahead_tokens: int,
+        reserved_blocks: int,
+        has_scheduled_reqs: bool,
+    ) -> KVCacheBlocks | None:
+        """allocate_slots without new computed (prefix-hit or external)
+        tokens, encoder tokens, full-sequence admission gate or delayed
+        caching: the same steps, with the coordinator's removal, block count
+        and allocation fused into one pass over the groups."""
+        num_computed_tokens = request.num_computed_tokens
+        total_computed_tokens = min(num_computed_tokens, self.max_model_len)
+        watermark_blocks = 0
+        if has_scheduled_reqs and request.status in (
+            RequestStatus.WAITING,
+            RequestStatus.PREEMPTED,
+        ):
+            watermark_blocks = self.watermark_blocks
+        num_tokens_main_model = total_computed_tokens + num_new_tokens
+        num_tokens_need_slot = min(
+            num_tokens_main_model + num_lookahead_tokens, self.max_model_len
+        )
+        new_blocks = self.coordinator.allocate_without_new_hits(
+            request.request_id,
+            max(0, total_computed_tokens - request.num_in_flight_tokens),
+            num_tokens_need_slot,
+            num_computed_tokens,
+            num_tokens_main_model,
+            reserved_blocks + watermark_blocks,
+        )
+        if new_blocks is None:
+            return None
+        num_tokens_to_cache = min(
+            total_computed_tokens + num_new_tokens, request.num_tokens
+        )
+        self.coordinator.cache_blocks(request, num_tokens_to_cache)
+        if not new_blocks:
+            return self.empty_kv_cache_blocks
         return self.create_kv_cache_blocks(new_blocks)
 
     def free(self, request: Request) -> None:
