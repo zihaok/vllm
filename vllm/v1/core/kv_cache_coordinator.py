@@ -14,9 +14,11 @@ from vllm.v1.core.kv_cache_utils import (
     partial_hash_hits_enabled,
 )
 from vllm.v1.core.single_type_kv_cache_manager import (
+    CircularBufferManager,
     CrossAttentionManager,
     MambaManager,
     SingleTypeKVCacheManager,
+    SlidingWindowManager,
     get_manager_for_kv_cache_spec,
 )
 from vllm.v1.kv_cache_interface import (
@@ -28,6 +30,47 @@ from vllm.v1.kv_cache_interface import (
     SlidingWindowSpec,
 )
 from vllm.v1.request import Request
+
+
+def _resolved_impl(manager: SingleTypeKVCacheManager, name: str):
+    """The class function ``manager.<name>`` dispatches to, or None when the
+    instance overrides it (hot-path specializations then stay off)."""
+    if name in vars(manager):
+        return None
+    return getattr(type(manager), name)
+
+
+def _remove_skipped_blocks_plan_entry(
+    manager: SingleTypeKVCacheManager,
+) -> tuple[SingleTypeKVCacheManager, int | None] | None:
+    """How ``KVCacheCoordinator.remove_skipped_blocks`` handles ``manager``.
+
+    Returns None when the manager's ``remove_skipped_blocks`` provably never
+    does anything (the base removal with no skipped tokens, e.g. full
+    attention, or the circular-buffer ring); ``(manager, offset)`` when it is
+    the base removal driven by ``SlidingWindowManager.get_num_skipped_tokens``
+    (``offset = sliding_window - 1 + extra_retained_tokens``), which the
+    coordinator inlines; ``(manager, None)`` to call the method as is.
+    """
+    base = SingleTypeKVCacheManager
+    remove = _resolved_impl(manager, "remove_skipped_blocks")
+    if remove is CircularBufferManager.remove_skipped_blocks:
+        return None
+    if remove is base.remove_skipped_blocks:
+        num_skipped = _resolved_impl(manager, "get_num_skipped_tokens")
+        if num_skipped is base.get_num_skipped_tokens:
+            return None
+        if (
+            num_skipped is SlidingWindowManager.get_num_skipped_tokens
+            and _resolved_impl(manager, "_remove_blocks_in_range")
+            is base._remove_blocks_in_range
+        ):
+            assert isinstance(manager, SlidingWindowManager)
+            return (
+                manager,
+                manager.sliding_window - 1 + manager.extra_retained_tokens,
+            )
+    return (manager, None)
 
 
 def _validate_prefix_cache_retention_interval(
@@ -187,6 +230,13 @@ class KVCacheCoordinator(ABC):
         self._is_cross_attn = tuple(
             isinstance(manager, CrossAttentionManager)
             for manager in self.single_type_managers
+        )
+        # Per-request hot path (every scheduled request, every step): drop the
+        # managers whose removal is a no-op and inline the sliding-window rule.
+        self._remove_skipped_blocks_plan = tuple(
+            entry
+            for manager in self.single_type_managers
+            if (entry := _remove_skipped_blocks_plan_entry(manager)) is not None
         )
 
         # A positive retention interval must be a multiple of the base hit granularity
@@ -454,10 +504,30 @@ class KVCacheCoordinator(ABC):
                 manager types ignore it.
 
         """
-        for manager in self.single_type_managers:
-            manager.remove_skipped_blocks(
-                request_id, processed_computed_tokens, num_prompt_tokens
+        for manager, swa_skip_offset in self._remove_skipped_blocks_plan:
+            if swa_skip_offset is None:
+                manager.remove_skipped_blocks(
+                    request_id, processed_computed_tokens, num_prompt_tokens
+                )
+                continue
+            # Inlined SlidingWindowManager.get_num_skipped_tokens and the base
+            # remove_skipped_blocks. The removal walks back from the last
+            # skipped block and stops at the first null block, so when that
+            # block is already null (the window has not crossed a new block
+            # since the last call) it frees nothing: skip the call.
+            num_skipped_tokens = processed_computed_tokens - swa_skip_offset
+            if num_skipped_tokens <= 0:
+                continue
+            blocks = manager.req_to_blocks[request_id]
+            num_skipped_blocks = min(
+                num_skipped_tokens // manager.block_size, len(blocks)
             )
+            if (
+                num_skipped_blocks == 0
+                or blocks[num_skipped_blocks - 1] is manager._null_block
+            ):
+                continue
+            manager._remove_blocks_in_range(request_id, 0, num_skipped_blocks)
 
     def get_blocks(self, request_id: str) -> tuple[list[KVCacheBlock], ...]:
         """Get the blocks for the request."""
