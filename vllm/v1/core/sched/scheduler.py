@@ -2776,12 +2776,20 @@ class Scheduler(SchedulerInterface):
         # a request is still being prefilled, we expect the model runner
         # to return empty token ids for the request.
         stopped = False
+        # Append token by token (a stop trims the rest), but hash the newly
+        # completed blocks once afterwards instead of after every token: the
+        # hashes depend only on the token ids, and check_stop does not read
+        # them. This is Request.append_output_token_ids, unrolled.
+        output_token_ids = request._output_token_ids
+        all_token_ids = request._all_token_ids
+        max_model_len = self.max_model_len
         for num_new, output_token_id in enumerate(new_token_ids, 1):
-            request.append_output_token_ids(output_token_id)
+            output_token_ids.append(output_token_id)
+            all_token_ids.append(output_token_id)
 
             # Check for stop and update request state.
             # This must be called before we make the EngineCoreOutput.
-            stopped = check_stop(request, self.max_model_len)
+            stopped = check_stop(request, max_model_len)
             if stopped:
                 # num_computed_tokens covers all new tokens but the last one.
                 # Keep that true after trimming: resumable requests resume from it.
@@ -2789,6 +2797,8 @@ class Scheduler(SchedulerInterface):
                     request.num_computed_tokens -= len(new_token_ids) - num_new
                 del new_token_ids[num_new:]  # Trim new tokens if needed.
                 break
+        if new_token_ids:
+            request.update_block_hashes()
 
         if not is_stale and request.num_output_placeholders > 0:
             # Resolve all returned tokens, including those trimmed at a stop.
