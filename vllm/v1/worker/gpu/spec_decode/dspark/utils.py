@@ -35,7 +35,15 @@ def _resolve_dspark_attention_backend(
 def _get_dspark_parallel_config(
     parallel_config: ParallelConfig,
     tensor_parallel_size: int,
+    enable_expert_parallel: bool | None = None,
 ) -> ParallelConfig:
+    if enable_expert_parallel is not None and (
+        parallel_config.pipeline_parallel_size != 1
+        or parallel_config.data_parallel_size != 1
+        or parallel_config.prefill_context_parallel_size != 1
+        or tensor_parallel_size != parallel_config.tensor_parallel_size
+    ):
+        raise ValueError("DSpark EP override requires DP=PP=PCP=1 and target TP")
     if parallel_config.enable_eplb:
         logger.warning_once(
             "EPLB is disabled for the DSpark draft model. EPLB remains enabled "
@@ -46,6 +54,11 @@ def _get_dspark_parallel_config(
         parallel_config,
         pipeline_parallel_size=1,
         tensor_parallel_size=tensor_parallel_size,
+        enable_expert_parallel=(
+            parallel_config.enable_expert_parallel
+            if enable_expert_parallel is None
+            else enable_expert_parallel
+        ),
         enable_eplb=False,
         eplb_config=replace(
             parallel_config.eplb_config,
@@ -59,6 +72,16 @@ def load_dspark_model(target_model: nn.Module, vllm_config: VllmConfig) -> nn.Mo
     speculative_config = vllm_config.speculative_config
     assert speculative_config is not None
     draft_model_config = speculative_config.draft_model_config
+    if speculative_config.draft_enable_expert_parallel is not None:
+        draft_moe_backend = (
+            speculative_config.moe_backend or vllm_config.kernel_config.moe_backend
+        )
+        if not vllm_config.model_config.is_moe or (
+            draft_moe_backend != "deep_gemm_mega_moe"
+        ):
+            raise ValueError(
+                "DSpark EP override requires a MoE target and native MegaMoE"
+            )
 
     from vllm.compilation.backends import set_model_tag
     from vllm.model_executor.model_loader import get_model
@@ -82,6 +105,7 @@ def load_dspark_model(target_model: nn.Module, vllm_config: VllmConfig) -> nn.Mo
         parallel_config=_get_dspark_parallel_config(
             vllm_config.parallel_config,
             speculative_config.draft_parallel_config.tensor_parallel_size,
+            speculative_config.draft_enable_expert_parallel,
         ),
         attention_config=replace(
             vllm_config.attention_config,

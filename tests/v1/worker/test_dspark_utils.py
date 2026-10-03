@@ -24,6 +24,9 @@ class _FakeEPLBConfig:
 class _FakeParallelConfig:
     pipeline_parallel_size: int = 2
     tensor_parallel_size: int = 8
+    data_parallel_size: int = 1
+    prefill_context_parallel_size: int = 1
+    enable_expert_parallel: bool = False
     enable_eplb: bool = True
     eplb_config: _FakeEPLBConfig = field(
         default_factory=lambda: _FakeEPLBConfig(num_redundant_experts=32)
@@ -58,6 +61,39 @@ def test_dspark_parallel_config_disables_eplb_atomically():
     assert draft_config.eplb_config.num_redundant_experts == 0
     assert not draft_config.enable_elastic_ep
     assert draft_config.eplb_config is not target_config.eplb_config
+
+
+@pytest.mark.parametrize("target_ep", [False, True])
+@pytest.mark.parametrize("draft_ep", [None, False, True])
+def test_dspark_ep_override_keeps_target_topology(target_ep, draft_ep):
+    target = _FakeParallelConfig(
+        pipeline_parallel_size=1,
+        tensor_parallel_size=4,
+        enable_expert_parallel=target_ep,
+    )
+    draft = _get_dspark_parallel_config(target, 4, draft_ep)
+    assert target.enable_expert_parallel == target_ep
+    assert draft.enable_expert_parallel == (
+        target_ep if draft_ep is None else draft_ep
+    )
+    assert draft.tensor_parallel_size == target.tensor_parallel_size == 4
+
+
+@pytest.mark.parametrize(
+    "changes",
+    [
+        {"pipeline_parallel_size": 2},
+        {"data_parallel_size": 4},
+        {"prefill_context_parallel_size": 2},
+        {"tensor_parallel_size": 8},
+    ],
+)
+def test_dspark_ep_override_rejects_different_rank_ownership(changes):
+    target = _FakeParallelConfig(
+        **{"pipeline_parallel_size": 1, "tensor_parallel_size": 4, **changes}
+    )
+    with pytest.raises(ValueError, match="DP=PP=PCP=1 and target TP"):
+        _get_dspark_parallel_config(target, 4, True)
 
 
 @pytest.mark.parametrize("pcp_size", [1, 4])

@@ -408,6 +408,10 @@ class SpeculativeConfig:
     draft_tensor_parallel_size: int | None = Field(default=None, ge=1)
     """The degree of the tensor parallelism for the draft model. Can only be 1
     or the same as the target model's tensor parallel size."""
+    draft_enable_expert_parallel: bool | None = None
+    """Override EP for a native MegaMoE DSpark draft on the target TP group.
+    Requires a MoE target with DP=PP=PCP=1 and the same draft TP size.
+    When None, the draft inherits the target EP setting."""
     tensor_parallel_size: int | None = None
     """Users should pass "draft_tensor_parallel_size". This parameter's purpose is to
     warn users when they mistakenly provide the wrong argument."""
@@ -633,6 +637,8 @@ class SpeculativeConfig:
         factors.append(uses_aux_hidden_states)
         if self.method == "dspark":
             factors.append(self.enable_adaptive_verification)
+            if self.draft_enable_expert_parallel is not None:
+                factors.append(self.draft_enable_expert_parallel)
 
         if self.draft_model_config is not None:
             factors.append(self.draft_model_config.compute_hash())
@@ -1582,6 +1588,14 @@ class SpeculativeConfig:
                         draft_model_config=self.draft_model_config,
                     )
                 )
+
+        if self.draft_enable_expert_parallel is not None:
+            if self.method != "dspark":
+                raise ValueError("draft_enable_expert_parallel requires method=dspark")
+            self.draft_parallel_config = replace(
+                self.draft_parallel_config,
+                enable_expert_parallel=self.draft_enable_expert_parallel,
+            )
 
         if self.index_share_for_mtp_iteration is not None:
             if self.method != "mtp" or self.draft_model_config is None:

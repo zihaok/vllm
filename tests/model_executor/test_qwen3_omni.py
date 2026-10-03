@@ -374,6 +374,8 @@ def test_dspark_shares_target_embedding_with_smaller_draft_vocabulary():
             draft_parallel_config=SimpleNamespace(tensor_parallel_size=1),
             attention_backend=None,
             kv_cache_dtype=None,
+            moe_backend=None,
+            draft_enable_expert_parallel=None,
             draft_load_config=None,
         ),
         parallel_config=ParallelConfig(),
