@@ -28,13 +28,10 @@ if(DEEPGEMM_SRC_DIR)
   message(STATUS "DeepGEMM using local DEEPGEMM_SRC_DIR: ${deepgemm_SOURCE_DIR}")
 else()
   # Keep in sync with tools/install_deepgemm.sh
-  set(_DEEPGEMM_UPSTREAM_REPO "https://github.com/vllm-project/DeepGEMM.git")
-  # Pinned to the fork's dev branch: upstream's 26/09/30 release (2.8.1)
-  # plus the SM120 port, the SM90 paged-MQA kv_block=32/next_n=4 port,
-  # configurable SwiGLU alpha/beta, SiTU for FP8/FP4 Mega MoE, and NVFP4
-  # Mega MoE, plus swiglustep for BF16/FP8/NVFP4 Mega MoE.
-  # Uses the PyTorch 2.11 stable ABI and CPython 3.10 limited API.
-  set(_DEEPGEMM_UPSTREAM_TAG "a7a927731b109fdfec770df7c2a5be5d7e2216b5")
+  set(_DEEPGEMM_UPSTREAM_REPO "https://github.com/zihaok/DeepGEMM.git")
+  # vLLM's a7a9277 stable-ABI baseline plus the SM107 MegaMoE port,
+  # per-die scheduling and locality-balancing fix.
+  set(_DEEPGEMM_UPSTREAM_TAG "3ec0eb47778f60547891fd4e84dd1f99449dad4d")
 
   set(_deepgemm_fc_root "${FETCHCONTENT_BASE_DIR}")
   if(NOT _deepgemm_fc_root)
@@ -58,6 +55,18 @@ else()
       GIT_SUBMODULES "third-party/cutlass" "third-party/deep_jit"
       GIT_PROGRESS TRUE
     )
+  endif()
+  # Do not silently reuse a FetchContent tree from the previous dependency pin.
+  find_package(Git REQUIRED)
+  execute_process(
+    COMMAND "${GIT_EXECUTABLE}" -C "${deepgemm_SOURCE_DIR}" rev-parse HEAD
+    OUTPUT_VARIABLE _deepgemm_actual_tag
+    OUTPUT_STRIP_TRAILING_WHITESPACE
+    COMMAND_ERROR_IS_FATAL ANY)
+  if(NOT _deepgemm_actual_tag STREQUAL _DEEPGEMM_UPSTREAM_TAG)
+    message(FATAL_ERROR
+      "Cached DeepGEMM is ${_deepgemm_actual_tag}, expected ${_DEEPGEMM_UPSTREAM_TAG}. "
+      "Remove ${_deepgemm_src} and reconfigure, or set DEEPGEMM_SRC_DIR explicitly.")
   endif()
   message(STATUS "DeepGEMM is available at ${deepgemm_SOURCE_DIR}")
 endif()
@@ -186,6 +195,12 @@ if(DEEPGEMM_ARCHS)
   # DeepGEMM's own CUDA headers
   install(DIRECTORY "${deepgemm_SOURCE_DIR}/deep_gemm/include/"
     DESTINATION vllm/third_party/deep_gemm/include
+    COMPONENT _deep_gemm_C)
+
+  # Optional native SM107 JIT target uses its own newer CUTLASS headers.
+  include(${CMAKE_CURRENT_LIST_DIR}/cutlass_sm107.cmake)
+  install(DIRECTORY "${CUTLASS_SM107_SOURCE_DIR}/include/"
+    DESTINATION vllm/third_party/deep_gemm/include/sm107_cutlass
     COMPONENT _deep_gemm_C)
 
   # CUTLASS and CuTe headers (vendored for JIT, separate from vLLM's CUTLASS)

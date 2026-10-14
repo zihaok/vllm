@@ -6,12 +6,9 @@ set -e
 
 # Default values
 # Keep DEEPGEMM_GIT_REF in sync with cmake/external_projects/deepgemm.cmake
-DEEPGEMM_GIT_REPO="https://github.com/vllm-project/DeepGEMM.git"
-# NOTE: This targets the vLLM fork's dev branch: upstream's 26/09/30 release
-# plus the sm120 and sm90 paged-MQA ports, the SwiGLU alpha/beta and SiTU
-# Mega MoE activations, NVFP4 Mega MoE, and BF16/FP8/NVFP4 swiglustep.
-# Uses the PyTorch 2.11 stable ABI and CPython 3.10 limited API.
-DEEPGEMM_GIT_REF="a7a927731b109fdfec770df7c2a5be5d7e2216b5"
+DEEPGEMM_GIT_REPO="https://github.com/zihaok/DeepGEMM.git"
+# vLLM a7a9277 plus the stable-ABI SM107 MegaMoE port and locality fix.
+DEEPGEMM_GIT_REF="3ec0eb47778f60547891fd4e84dd1f99449dad4d"
 WHEEL_DIR=""
 
 # Parse command line arguments
