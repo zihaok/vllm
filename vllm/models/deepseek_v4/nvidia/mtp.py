@@ -30,6 +30,9 @@ from vllm.model_executor.kernels.mhc.tilelang import (
 from vllm.model_executor.layers.fused_moe import (
     fused_moe_make_expert_params_mapping,
 )
+from vllm.model_executor.layers.fused_moe.deep_gemm_mega_moe import (
+    DeepGemmMegaMoEExperts,
+)
 from vllm.model_executor.layers.layernorm import RMSNorm
 from vllm.model_executor.layers.linear import ReplicatedLinear
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
@@ -518,6 +521,9 @@ class DeepSeekV4MTP(nn.Module):
                     f"Use a checkpoint that includes MTP layer weights, "
                     f"or disable speculative decoding."
                 )
+        for module in self.model.modules():
+            if isinstance(module, DeepGemmMegaMoEExperts):
+                module.prepare_rubin_weights()
         logger.info_once("MTP draft model loaded: %d params", len(loaded_params))
         return loaded_params
 

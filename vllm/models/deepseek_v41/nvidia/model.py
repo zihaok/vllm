@@ -34,6 +34,9 @@ from vllm.model_executor.kernels.mhc.triton import hc_collapse_triton
 from vllm.model_executor.layers.fused_moe import (
     fused_moe_make_expert_params_mapping,
 )
+from vllm.model_executor.layers.fused_moe.deep_gemm_mega_moe import (
+    DeepGemmMegaMoEExperts,
+)
 from vllm.model_executor.layers.fused_moe.experts.trtllm_mxfp4_moe import (
     TrtLlmMxfp4ExpertsModular,
 )
@@ -1720,6 +1723,9 @@ class DeepseekV41LLMForCausalLM(
 
     def process_weights_after_loading(self) -> None:
         self.model.finalize_mhc_broadcast_weights()
+        for module in self.model.modules():
+            if isinstance(module, DeepGemmMegaMoEExperts):
+                module.prepare_rubin_weights()
 
     def get_expert_mapping(self) -> list[tuple[str, str, int, str]]:
         return self.model.get_expert_mapping()

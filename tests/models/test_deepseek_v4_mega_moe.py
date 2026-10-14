@@ -312,6 +312,7 @@ def test_deepseek_v4_pwal_hook_finalizes_mhc_broadcast():
     stub = SimpleNamespace(
         model=SimpleNamespace(
             finalize_mhc_broadcast_weights=lambda: calls.append("mhc"),
+            modules=lambda: [],
         )
     )
 

@@ -303,6 +303,8 @@ if TYPE_CHECKING:
     VLLM_DEBUG_WORKSPACE: bool = False
     VLLM_DISABLE_SHARED_EXPERTS_STREAM: bool = False
     VLLM_DISABLE_DSV4_MEGAMOE_SHARED_EXPERT_FUSION: bool = False
+    VLLM_DSV41_MEGAMOE_SM107: bool = False
+    VLLM_DSV41_MEGAMOE_PERDIE: str = "0"
     VLLM_SHARED_EXPERTS_STREAM_TOKEN_THRESHOLD: int = 256
     VLLM_MULTI_STREAM_GEMM_TOKEN_THRESHOLD: int = 1024
     VLLM_COMPILE_CACHE_SAVE_FORMAT: Literal["binary", "unpacked"] = "binary"
@@ -2103,6 +2105,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_DISABLE_DSV4_MEGAMOE_SHARED_EXPERT_FUSION": lambda: bool(
         int(os.getenv("VLLM_DISABLE_DSV4_MEGAMOE_SHARED_EXPERT_FUSION", "0"))
     ),
+    # Opt-in SM107 MegaMoE dispatch on Rubin.
+    "VLLM_DSV41_MEGAMOE_SM107": lambda: bool(
+        int(os.getenv("VLLM_DSV41_MEGAMOE_SM107", "0"))
+    ),
+    # Per-die SM107 execution: "1" localizes routed and shared weights;
+    # "routed" localizes routed weights only. Requires SM107; excludes EPLB.
+    "VLLM_DSV41_MEGAMOE_PERDIE": lambda: os.getenv("VLLM_DSV41_MEGAMOE_PERDIE", "0"),
     # Limits when we run shared_experts in a separate stream.
     # We found out that for large batch sizes, the separate stream
     # execution is not beneficial (most likely because of the input clone)

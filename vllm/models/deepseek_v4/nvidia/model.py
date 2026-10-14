@@ -1406,6 +1406,9 @@ class DeepseekV4ForCausalLM(
 
     def process_weights_after_loading(self) -> None:
         self.model.finalize_mhc_broadcast_weights()
+        for module in self.model.modules():
+            if isinstance(module, DeepGemmMegaMoEExperts):
+                module.prepare_rubin_weights()
 
     def get_expert_mapping(self) -> list[tuple[str, str, int, str]]:
         return self.model.get_expert_mapping()

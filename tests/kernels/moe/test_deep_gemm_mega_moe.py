@@ -1272,3 +1272,56 @@ def test_deep_gemm_mega_moe_matches_reference(dist_init, fmt_name, shared, act_n
     assert output.dtype == torch.bfloat16
     assert _calc_diff(output, expected) < 1e-3
     assert F.cosine_similarity(output.float(), expected, dim=-1).min() > 0.99
+
+
+def test_rubin_localization_preserves_parameters_and_reload(monkeypatch):
+    """Per-die layout preserves loaders and accepts a second shuffled checkpoint."""
+    import vllm.model_executor.layers.fused_moe.deep_gemm_mega_moe as model
+
+    experts = _make_mega_moe_experts(4, 3)
+    ckpt = _load_mega_moe_checkpoint_shuffled(experts, 3, seed=0)
+    expected = _reference_mega_moe_layout(
+        *(tensor[torch.arange(4) % 3] for tensor in ckpt.values())
+    )
+    params = dict(experts.named_parameters())
+    calls = []
+
+    def localize(t):
+        calls.append(t.shape)
+        return t.unflatten(-2, (2, -1)).movedim(-3, 0).contiguous()
+
+    monkeypatch.setattr(model, "_maybe_enable_megamoe_sm107", lambda _: None)
+    monkeypatch.setattr(
+        model,
+        "_get_megamoe_locality_module",
+        lambda _: SimpleNamespace(
+            localize=localize, get_balanced_sm_locality_domains=lambda: None
+        ),
+    )
+    monkeypatch.setattr("vllm.utils.deep_gemm._import_deep_gemm", lambda: None)
+    monkeypatch.setattr(model.envs, "VLLM_DSV41_MEGAMOE_PERDIE", "routed")
+    experts.prepare_rubin_weights()
+    ptrs = [p.data_ptr() for p in experts.parameters()]
+    experts.prepare_rubin_weights()
+    assert len(calls) == 2
+    assert all(p is getattr(experts, n) for n, p in params.items())
+
+    def check(reference):
+        for actual, wanted in zip(
+            (*experts.l1_weights, *experts.l2_weights),
+            reference,
+        ):
+            if actual.ndim == 4:
+                actual = actual.movedim(0, -3).flatten(-3, -2)
+            assert torch.equal(actual, wanted)
+
+    check(expected)
+    ckpt = _load_mega_moe_checkpoint_shuffled(experts, 3, seed=1)
+    check(
+        _reference_mega_moe_layout(
+            *(tensor[torch.arange(4) % 3] for tensor in ckpt.values())
+        )
+    )
+    assert [p.data_ptr() for p in experts.parameters()] == ptrs
+    with pytest.raises(NotImplementedError, match="EPLB"):
+        experts.get_expert_weights()
