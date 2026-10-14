@@ -1,5 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import importlib
+import os
 import typing
 from collections.abc import Callable, Iterable
 from itertools import islice
@@ -207,6 +209,56 @@ def make_deepseek_v4_expert_params_mapping(
     ]
 
 
+def _maybe_enable_megamoe_sm107(deep_gemm) -> None:
+    """Enable opt-in Rubin MegaMoE before the first call or graph capture."""
+    if not envs.VLLM_DSV41_MEGAMOE_SM107:
+        return
+    impl = os.path.join(
+        os.path.dirname(deep_gemm.__file__),
+        "include/deep_gemm/impls/sm107_fp8_fp4_mega_moe.cuh",
+    )
+    if torch.cuda.get_device_capability() != (10, 7) or not os.path.exists(impl):
+        logger.warning_once(
+            "VLLM_DSV41_MEGAMOE_SM107=1 ignored: requires a capability 10.7 GPU "
+            "and the Rubin-patched DeepGEMM (%s not found).",
+            impl,
+        )
+        return
+    os.environ.setdefault("DG_MEGA_MOE_SM107", "1")
+    logger.info_once(
+        "DeepGEMM MegaMoE: Rubin SM107 kernel enabled (DG_MEGA_MOE_SM107=%s).",
+        os.environ["DG_MEGA_MOE_SM107"],
+    )
+
+
+def _get_megamoe_locality_module(deep_gemm):
+    """Return the locality helpers when per-die SM107 execution is enabled."""
+    mode = envs.VLLM_DSV41_MEGAMOE_PERDIE
+    if mode not in ("1", "routed"):
+        return None
+    try:
+        locality = importlib.import_module(deep_gemm.__name__ + ".mega.sm107_locality")
+        available = locality.is_localization_available()
+    except (ImportError, AttributeError, RuntimeError) as e:
+        locality, available = None, False
+        logger.warning_once(
+            "Per-die DeepGEMM unavailable (%s); ignoring VLLM_DSV41_MEGAMOE_PERDIE.",
+            e,
+        )
+    if not available or os.environ.get("DG_MEGA_MOE_SM107") != "1":
+        logger.warning_once(
+            "VLLM_DSV41_MEGAMOE_PERDIE ignored: it needs the SM107 MegaMoE kernel "
+            "(VLLM_DSV41_MEGAMOE_SM107=1) on a 2-locality-domain Rubin GPU."
+        )
+        return None
+    os.environ.setdefault("DG_MEGA_MOE_SM107_PERDIE", "1")
+    logger.info_once(
+        "DeepGEMM MegaMoE: per-die execution with die-local %s weights.",
+        "routed and shared expert" if mode == "1" else "routed expert",
+    )
+    return locality
+
+
 class DeepseekV4MegaMoEExperts(nn.Module):
     _symm_buffer_cache: dict[
         tuple[int, int, int, int, int, int, int, int, str], object
@@ -279,6 +331,44 @@ class DeepseekV4MegaMoEExperts(nn.Module):
             raise ValueError(f"Duplicate layer name: {prefix}")
         compilation_config.static_forward_context[prefix] = self
 
+    def prepare_rubin_weights(self) -> None:
+        """Enable Rubin dispatch and localize loaded weights before graph capture."""
+        if not envs.VLLM_DSV41_MEGAMOE_SM107 and (
+            envs.VLLM_DSV41_MEGAMOE_PERDIE not in ("1", "routed")
+        ):
+            return
+        from vllm.utils.deep_gemm import _import_deep_gemm
+
+        deep_gemm = _import_deep_gemm()
+        _maybe_enable_megamoe_sm107(deep_gemm)
+        locality = _get_megamoe_locality_module(deep_gemm)
+        if locality is None or getattr(self, "_weights_localized", False):
+            return
+        if self.backend.mma_type != "fp8xfp4":
+            raise NotImplementedError("SM107 localization requires the FP8/FP4 backend")
+        if self.eplb_state.logical_to_physical_map is not None:
+            raise NotImplementedError("Per-die MegaMoE does not support EPLB")
+        locality.get_balanced_sm_locality_domains()
+        names = ["w13_weight", "w2_weight"]
+        if envs.VLLM_DSV41_MEGAMOE_PERDIE == "1" and self.has_fused_shared_experts:
+            names += ["shared_l1_weight", "shared_l2_weight"]
+        for name in names:
+            param = getattr(self, name)
+            # Preserve the Parameter and its loader attributes; replace storage.
+            param.data = locality.localize(param.data)
+        self._localized_weight_names = frozenset(names)
+        self._weights_localized = True
+        torch.cuda.empty_cache()
+
+    def _load_localized_weight(
+        self, dst: torch.Tensor, src: torch.Tensor, shard_id: str
+    ) -> None:
+        # Reload through the backend's logical (N, K) view, then restore the
+        # per-domain layout without allocating another native reservation.
+        logical = dst.flatten(0, 1).clone()
+        self.backend.load_weight(logical, src, shard_id, False)
+        dst.copy_(logical.view_as(dst))
+
     def _map_global_expert_id(self, expert_id: int) -> list[int]:
         """Return local (per-rank) slot offsets where logical expert
         `expert_id` should land on this rank.
@@ -304,9 +394,14 @@ class DeepseekV4MegaMoEExperts(nn.Module):
             return False if return_success else None
         is_scale = weight_name.endswith("weight_scale")
         for local_expert_id in local_expert_ids:
-            self.backend.load_weight(
-                param.data[local_expert_id], loaded_weight, shard_id, is_scale
-            )
+            if not is_scale and getattr(self, "_weights_localized", False):
+                self._load_localized_weight(
+                    param.data[:, local_expert_id], loaded_weight, shard_id
+                )
+            else:
+                self.backend.load_weight(
+                    param.data[local_expert_id], loaded_weight, shard_id, is_scale
+                )
         return True if return_success else None
 
     def load_shared_expert_weight(self, name: str, loaded_weight: torch.Tensor) -> str:
@@ -330,7 +425,12 @@ class DeepseekV4MegaMoEExperts(nn.Module):
             "w1" if ".w1." in weight_name else "w3" if ".w3." in weight_name else "w2"
         )
         is_scale = "weight_scale" in weight_name
-        self.backend.load_weight(param.data, loaded_weight, shard_id, is_scale)
+        localized_names = getattr(self, "_localized_weight_names", ())
+        localized = any(param is getattr(self, name) for name in localized_names)
+        if localized:
+            self._load_localized_weight(param.data, loaded_weight, shard_id)
+        else:
+            self.backend.load_weight(param.data, loaded_weight, shard_id, is_scale)
 
     @property
     def _transformed_l1_weights(self) -> tuple[torch.Tensor, torch.Tensor]:
@@ -387,6 +487,8 @@ class DeepseekV4MegaMoEExperts(nn.Module):
         logical_to_physical_map: torch.Tensor,
         logical_replica_count: torch.Tensor,
     ) -> None:
+        if envs.VLLM_DSV41_MEGAMOE_PERDIE in ("1", "routed"):
+            raise NotImplementedError("Per-die MegaMoE does not support EPLB")
         self.eplb_state.set_layer_state(
             moe_layer_idx,
             expert_load_view,
@@ -395,6 +497,9 @@ class DeepseekV4MegaMoEExperts(nn.Module):
         )
 
     def get_expert_weights(self) -> list[torch.Tensor]:
+        if getattr(self, "_weights_localized", False):
+            raise NotImplementedError("Per-die MegaMoE does not support EPLB")
+
         def _to_eplb_view(name: str, t: torch.Tensor) -> torch.Tensor:
             """Return a (num_local_experts, -1) view with contiguous memory layout."""
             assert t.shape[0] == self.num_local_experts
@@ -1757,6 +1862,9 @@ class DeepseekV4ForCausalLM(
 
     def process_weights_after_loading(self) -> None:
         self.model.finalize_mhc_broadcast_weights()
+        for module in self.model.modules():
+            if isinstance(module, DeepseekV4MegaMoEExperts):
+                module.prepare_rubin_weights()
 
     def get_expert_mapping(self) -> list[tuple[str, str, int, str]]:
         return self.model.get_expert_mapping()

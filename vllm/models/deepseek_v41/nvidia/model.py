@@ -75,12 +75,13 @@ from vllm.models.common.ops.sequence_parallel import (
     sp_shard,
 )
 from vllm.models.deepseek_v4.nvidia.model import (
-    DeepseekV4MoE as DeepseekV4MoEBase,
-)
-from vllm.models.deepseek_v4.nvidia.model import (
+    DeepseekV4MegaMoEExperts,
     MegaGateRoutingMetadata,
     make_deepseek_v4_expert_params_mapping,
     prepare_mega_gate_routing_metadata,
+)
+from vllm.models.deepseek_v4.nvidia.model import (
+    DeepseekV4MoE as DeepseekV4MoEBase,
 )
 from vllm.models.deepseek_v41.attention import DeepseekV4Attention
 from vllm.models.deepseek_v41.decoder_replay_layers import DecoderReplayLayers
@@ -1686,6 +1687,9 @@ class DeepseekV41LLMForCausalLM(
 
     def process_weights_after_loading(self) -> None:
         self.model.finalize_mhc_broadcast_weights()
+        for module in self.model.modules():
+            if isinstance(module, DeepseekV4MegaMoEExperts):
+                module.prepare_rubin_weights()
 
     def get_expert_mapping(self) -> list[tuple[str, str, int, str]]:
         return self.model.get_expert_mapping()

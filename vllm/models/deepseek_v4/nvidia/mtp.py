@@ -61,6 +61,7 @@ from vllm.sequence import IntermediateTensors
 
 from .model import (
     DeepseekV4DecoderLayer,
+    DeepseekV4MegaMoEExperts,
     DeepseekV4Model,
     _use_sequence_parallel,
     make_deepseek_v4_expert_params_mapping,
@@ -536,6 +537,9 @@ class DeepSeekV4MTP(nn.Module):
                     f"Use a checkpoint that includes MTP layer weights, "
                     f"or disable speculative decoding."
                 )
+        for module in self.model.modules():
+            if isinstance(module, DeepseekV4MegaMoEExperts):
+                module.prepare_rubin_weights()
         logger.info_once("MTP draft model loaded: %d params", len(loaded_params))
         return loaded_params
 
