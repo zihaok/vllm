@@ -1274,21 +1274,91 @@ def test_deep_gemm_mega_moe_matches_reference(dist_init, fmt_name, shared, act_n
     assert F.cosine_similarity(output.float(), expected, dim=-1).min() > 0.99
 
 
-def test_rubin_localization_preserves_parameters_and_reload(monkeypatch):
-    """Per-die layout preserves loaders and accepts a second shuffled checkpoint."""
+@pytest.mark.parametrize("mode", ["routed", "1"])
+@pytest.mark.parametrize("domain_padding", [0, 16])
+def test_rubin_localization_preserves_parameters_and_reload(
+    monkeypatch, mode, domain_padding
+):
+    """Per-die routed/shared storage preserves loaders, padding and reloads."""
     import vllm.model_executor.layers.fused_moe.deep_gemm_mega_moe as model
 
-    experts = _make_mega_moe_experts(4, 3)
-    ckpt = _load_mega_moe_checkpoint_shuffled(experts, 3, seed=0)
-    expected = _reference_mega_moe_layout(
-        *(tensor[torch.arange(4) % 3] for tensor in ckpt.values())
+    monkeypatch.setattr(
+        DeepGemmMegaMoEExperts, "_kernel_fuses_shared_experts", lambda self, spec: True
     )
+    experts = _make_experts(
+        num_experts=4,
+        num_local_experts=4,
+        experts_start_idx=0,
+        top_k=1,
+        hidden_size=256,
+        intermediate_size=384,
+        num_logical_experts=3,
+        shared_experts=_shared_mlp(256, 384),
+    )
+
+    def load_checkpoint(seed):
+        ckpt = _load_mega_moe_checkpoint_shuffled(experts, 3, seed=seed)
+        expected = dict(
+            zip(
+                ("w13_weight", "w13_weight_scale", "w2_weight", "w2_weight_scale"),
+                _reference_mega_moe_layout(
+                    *(tensor[torch.arange(4) % 3] for tensor in ckpt.values())
+                ),
+            )
+        )
+        generator = torch.Generator().manual_seed(seed)
+        shared_shapes = ((384, 256), (384, 256), (256, 384))
+        shared_weights: list[torch.Tensor] = []
+        shared_scales: list[torch.Tensor] = []
+        for shard, shape in zip(("w1", "w3", "w2"), shared_shapes):
+            for suffix, dtype, tensors, tensor_shape in (
+                ("weight", torch.float8_e4m3fn, shared_weights, shape),
+                (
+                    "weight_scale",
+                    torch.float8_e8m0fnu,
+                    shared_scales,
+                    (shape[0], shape[1] // 32),
+                ),
+            ):
+                data = torch.randint(
+                    0, 120, tensor_shape, dtype=torch.uint8, generator=generator
+                )
+                tensors.append(data)
+                experts.load_shared_expert_weight(
+                    f"ffn.shared_experts.{shard}.{suffix}", data.view(dtype)
+                )
+        w1, w3, w2 = shared_weights
+        s1, s3, s2 = shared_scales
+        transformed = _reference_mega_moe_layout(
+            *(
+                t.unsqueeze(0)
+                for t in (torch.cat([w1, w3]), torch.cat([s1, s3]), w2, s2)
+            )
+        )
+        expected.update(
+            zip(
+                (
+                    "shared_l1_weight",
+                    "shared_l1_weight_scale",
+                    "shared_l2_weight",
+                    "shared_l2_weight_scale",
+                ),
+                (t.squeeze(0) for t in transformed),
+            )
+        )
+        return expected
+
+    expected = load_checkpoint(0)
     params = dict(experts.named_parameters())
     calls = []
 
     def localize(t):
         calls.append(t.shape)
-        return t.unflatten(-2, (2, -1)).movedim(-3, 0).contiguous()
+        logical = t.unflatten(-2, (2, -1)).movedim(-3, 0).contiguous()
+        stride = (logical[0].numel() + domain_padding, *logical.stride()[1:])
+        localized = torch.empty_strided(logical.shape, stride, dtype=t.dtype)
+        localized.copy_(logical)
+        return localized
 
     monkeypatch.setattr(model, "_maybe_enable_megamoe_sm107", lambda _: None)
     monkeypatch.setattr(
@@ -1299,29 +1369,22 @@ def test_rubin_localization_preserves_parameters_and_reload(monkeypatch):
         ),
     )
     monkeypatch.setattr("vllm.utils.deep_gemm._import_deep_gemm", lambda: None)
-    monkeypatch.setattr(model.envs, "VLLM_DSV41_MEGAMOE_PERDIE", "routed")
+    monkeypatch.setattr(model.envs, "VLLM_DSV41_MEGAMOE_PERDIE", mode)
     experts.prepare_rubin_weights()
     ptrs = [p.data_ptr() for p in experts.parameters()]
     experts.prepare_rubin_weights()
-    assert len(calls) == 2
+    assert len(calls) == (4 if mode == "1" else 2)
     assert all(p is getattr(experts, n) for n, p in params.items())
 
     def check(reference):
-        for actual, wanted in zip(
-            (*experts.l1_weights, *experts.l2_weights),
-            reference,
-        ):
-            if actual.ndim == 4:
+        for name, wanted in reference.items():
+            actual = getattr(experts, name)
+            if name in experts._localized_weight_names:
                 actual = actual.movedim(0, -3).flatten(-3, -2)
-            assert torch.equal(actual, wanted)
+            assert torch.equal(actual.view(wanted.dtype), wanted)
 
     check(expected)
-    ckpt = _load_mega_moe_checkpoint_shuffled(experts, 3, seed=1)
-    check(
-        _reference_mega_moe_layout(
-            *(tensor[torch.arange(4) % 3] for tensor in ckpt.values())
-        )
-    )
+    check(load_checkpoint(1))
     assert [p.data_ptr() for p in experts.parameters()] == ptrs
     with pytest.raises(NotImplementedError, match="EPLB"):
         experts.get_expert_weights()
