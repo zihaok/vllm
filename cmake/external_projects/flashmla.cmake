@@ -30,6 +30,48 @@ endif()
 FetchContent_MakeAvailable(flashmla)
 message(STATUS "FlashMLA is available at ${flashmla_SOURCE_DIR}")
 
+# `_flashmla_C` is compiled against CUTLASS 4.8 (cutlass_sm107.cmake), not the
+# FlashMLA submodule's CUTLASS, which predates SM107. Two source edits keep
+# FlashMLA compatible with it (see the patch header comments):
+#   - kerutils sm100/gemm.cuh: TMEM::MAX_CAPACITY_BITS was removed;
+#   - dense fmha_common.hpp: a dead fp8 overload uses the old non-template
+#     SM100_MMA_F8F6F4_SS.
+find_package(Git REQUIRED)
+set(_flashmla_cutlass48_patch
+    "${CMAKE_SOURCE_DIR}/cmake/patches/flashmla-cutlass48-sm107.patch")
+execute_process(
+  COMMAND "${GIT_EXECUTABLE}" -C "${flashmla_SOURCE_DIR}"
+          apply --check "${_flashmla_cutlass48_patch}"
+  RESULT_VARIABLE _flashmla_patch_check
+  OUTPUT_QUIET
+  ERROR_QUIET)
+if(_flashmla_patch_check EQUAL 0)
+  execute_process(
+    COMMAND "${GIT_EXECUTABLE}" -C "${flashmla_SOURCE_DIR}"
+            apply "${_flashmla_cutlass48_patch}"
+    COMMAND_ERROR_IS_FATAL ANY)
+else()
+  # A cached FetchContent tree may already contain the patch.
+  execute_process(
+    COMMAND "${GIT_EXECUTABLE}" -C "${flashmla_SOURCE_DIR}"
+            apply --reverse --check "${_flashmla_cutlass48_patch}"
+    RESULT_VARIABLE _flashmla_reverse_patch_check
+    OUTPUT_QUIET
+    ERROR_QUIET)
+  if(NOT _flashmla_reverse_patch_check EQUAL 0)
+    if(FLASH_MLA_SRC_DIR)
+      # A user tree (e.g. a FlashMLA fork) may already be CUTLASS 4.8 ready.
+      message(WARNING
+        "FlashMLA CUTLASS 4.8 patch does not apply to FLASH_MLA_SRC_DIR "
+        "${flashmla_SOURCE_DIR}; assuming the tree is already compatible")
+    else()
+      message(FATAL_ERROR
+        "FlashMLA CUTLASS 4.8 patch does not apply cleanly to "
+        "${flashmla_SOURCE_DIR}")
+    endif()
+  endif()
+endif()
+
 # Vendor FlashMLA interface into vLLM with torch-ops shim.
 set(FLASHMLA_VENDOR_DIR "${CMAKE_SOURCE_DIR}/vllm/third_party/flashmla")
 file(MAKE_DIRECTORY "${FLASHMLA_VENDOR_DIR}")
@@ -156,12 +198,34 @@ if(FLASH_MLA_ARCHS)
         ${flashmla_SOURCE_DIR}/csrc/extension/sm90/dense_fp8/flash_fwd_mla_metadata.cu
     )
 
+    include(${CMAKE_CURRENT_LIST_DIR}/cutlass_sm107.cmake)
     set(FlashMLA_INCLUDES
         ${flashmla_SOURCE_DIR}/csrc
         ${flashmla_SOURCE_DIR}/csrc/kerutils/include
-        ${flashmla_SOURCE_DIR}/csrc/cutlass/include
-        ${flashmla_SOURCE_DIR}/csrc/cutlass/tools/util/include
+        ${CUTLASS_SM107_SOURCE_DIR}/include
+        ${CUTLASS_SM107_SOURCE_DIR}/tools/util/include
     )
+
+    # `_flashmla_C` architectures: the SM100-family cubin (10.0f) plus a
+    # native Rubin cubin (10.7a) when nvcc can target it. The driver prefers
+    # sm_107a on Rubin, which enables the tcgen05.ld.red epilogue
+    # (KERUTILS_ENABLE_SM103A); 10.7f is replaced by 10.7a. Safe only with
+    # CUTLASS >= 4.8 (above): older CUTLASS has no SM107, and an sm_107 cubin
+    # built against it traps at runtime.
+    set(FLASH_MLA_C_ARCHS ${FLASH_MLA_ARCHS})
+    list(FILTER FLASH_MLA_C_ARCHS EXCLUDE REGEX "^10\\.7")
+    if(${CMAKE_CUDA_COMPILER_VERSION} VERSION_GREATER_EQUAL 13.4)
+        set(_flashmla_has_sm10x FALSE)
+        foreach(_arch IN LISTS FLASH_MLA_ARCHS)
+            if(_arch MATCHES "^10\\.")
+                set(_flashmla_has_sm10x TRUE)
+            endif()
+        endforeach()
+        if(_flashmla_has_sm10x)
+            list(APPEND FLASH_MLA_C_ARCHS "10.7a")
+        endif()
+    endif()
+    message(STATUS "FlashMLA _flashmla_C CUDA architectures: ${FLASH_MLA_C_ARCHS}")
 
     set(FlashMLA_Extension_INCLUDES
         ${flashmla_SOURCE_DIR}/csrc
@@ -173,7 +237,7 @@ if(FLASH_MLA_ARCHS)
 
     set_gencode_flags_for_srcs(
         SRCS "${FlashMLA_SOURCES}"
-        CUDA_ARCHS "${FLASH_MLA_ARCHS}")
+        CUDA_ARCHS "${FLASH_MLA_C_ARCHS}")
 
     set_gencode_flags_for_srcs(
         SRCS "${FlashMLA_Extension_SOURCES}"
@@ -184,7 +248,8 @@ if(FLASH_MLA_ARCHS)
         DESTINATION vllm
         LANGUAGE ${VLLM_GPU_LANG}
         SOURCES ${FlashMLA_SOURCES}
-        COMPILE_FLAGS ${VLLM_GPU_FLAGS}
+        # --use_fast_math: exp2f/logf without the non-ftz range fix-ups.
+        COMPILE_FLAGS ${VLLM_FLASHMLA_GPU_FLAGS}
         ARCHITECTURES ${VLLM_GPU_ARCHES}
         INCLUDE_DIRECTORIES ${FlashMLA_INCLUDES}
         USE_SABI 3
