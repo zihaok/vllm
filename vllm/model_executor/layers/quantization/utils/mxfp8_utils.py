@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import os
+
 import torch
 
 from vllm.utils.torch_utils import direct_register_custom_op
@@ -184,6 +186,115 @@ def _mxfp8_e4m3_quantize_triton(
     return xq, scales
 
 
+# Opt-in Triton kernel for the 2D BF16 -> MXFP8 activation quant with F8_128x4
+# swizzled scales (bit-identical to FlashInfer's cute-dsl kernel). FlashInfer's
+# row-loop kernel reaches ~5 TB/s on VR200 (DSV4.1 wqa_wkv / wo_b inputs).
+_TRITON_SWIZZLED_QUANT = os.environ.get("VLLM_MXFP8_TRITON_QUANT", "0") == "1"
+_MXFP8_SWIZZLED_KERNEL = None
+
+
+def _mxfp8_quant_swizzled_triton_kernel():
+    from vllm.triton_utils import tl, triton
+
+    @triton.jit(do_not_specialize=["M", "padded_m"])
+    def _kernel(
+        x,
+        xq,
+        scales,
+        M,
+        padded_m,
+        x_stride,
+        K: tl.constexpr,
+        BM: tl.constexpr,
+        BK: tl.constexpr,
+        LAUNCH_PDL: tl.constexpr,
+    ):
+        if LAUNCH_PDL:
+            tl.extra.cuda.gdc_wait()
+            tl.extra.cuda.gdc_launch_dependents()
+        NB: tl.constexpr = BK // 32
+        PADDED_COLS: tl.constexpr = K // 32
+        rows = tl.program_id(0) * BM + tl.arange(0, BM)
+        cols = tl.program_id(1) * BK + tl.arange(0, BK)
+        rmask = rows < M
+        r64 = rows.to(tl.int64)
+        v = tl.load(
+            x + r64[:, None] * x_stride + cols[None, :], rmask[:, None], other=0.0
+        ).to(tl.float32)
+        g = tl.reshape(v, (BM, NB, 32))
+        amax = tl.max(tl.abs(g), 2)
+        # FlashInfer float_to_ue8m0_fast / ue8m0_to_inv_scale_fast.
+        normalized = amax * (1.0 / 448.0)
+        bits = normalized.to(tl.uint32, bitcast=True)
+        exponent = (bits >> 23) & 255
+        mantissa = bits & 0x7FFFFF
+        bump = (mantissa != 0) & ~((exponent == 0) & (mantissa <= 0x400000))
+        sf = tl.minimum(exponent + bump, 254)
+        sf = tl.where(normalized <= 0, 0, sf)
+        inv_bits = tl.where(sf == 0, 0, (254 - sf) << 23)
+        inv_scale = inv_bits.to(tl.float32, bitcast=True)
+        q = g * inv_scale[:, :, None]
+        # Saturate before the satfinite cast like FlashInfer (NaN -> 448).
+        q = tl.maximum(tl.minimum(q, 448.0), -448.0)
+        q = tl.reshape(q, (BM, BK)).to(tl.float8e4nv)
+        tl.store(xq + r64[:, None] * K + cols[None, :], q, rmask[:, None])
+        groups = tl.program_id(1) * NB + tl.arange(0, NB)
+        sf = tl.where(rmask[:, None], sf, 0).to(tl.uint8)
+        # F8_128x4: [row/128, group/4, row%32, row%128/32, group%4].
+        offsets = (
+            r64[:, None] // 128 * (128 * PADDED_COLS)
+            + groups[None, :] // 4 * 512
+            + r64[:, None] % 32 * 16
+            + r64[:, None] % 128 // 32 * 4
+            + groups[None, :] % 4
+        )
+        tl.store(scales + offsets, sf, rows[:, None] < padded_m)
+
+    return _kernel
+
+
+def mxfp8_quantize_swizzled_triton(
+    x: torch.Tensor, block_m: int = 16, block_k: int = 0, num_warps: int = 4
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """BF16 [M, K] -> (e4m3 [M, K], ue8m0 F8_128x4-swizzled scales), K % 128 == 0.
+
+    Defaults (16 x 512 tiles, 4 warps) were the best or within 3% on VR200 for
+    K in {1280, 5120, 6144, 8192, 15360} and M in [300, 6144] (~10 TB/s vs ~6 TB/s
+    for FlashInfer's cute-dsl kernel; kernels/dense/bench/bench_quant.py)."""
+    from vllm.platforms import current_platform
+    from vllm.triton_utils import triton
+
+    global _MXFP8_SWIZZLED_KERNEL
+    if _MXFP8_SWIZZLED_KERNEL is None:
+        _MXFP8_SWIZZLED_KERNEL = _mxfp8_quant_swizzled_triton_kernel()
+    M, K = x.shape
+    assert K % 128 == 0 and x.stride(1) == 1
+    if not block_k:
+        block_k = 512 if K % 512 == 0 else (256 if K % 256 == 0 else 128)
+    padded_m = (M + 127) // 128 * 128
+    xq = torch.empty((M, K), dtype=MXFP8_VALUE_DTYPE, device=x.device)
+    scales = torch.empty(
+        padded_m * (K // MXFP8_BLOCK_SIZE), dtype=MXFP8_SCALE_DTYPE, device=x.device
+    )
+    if padded_m:
+        launch_pdl = current_platform.is_arch_support_pdl()
+        _MXFP8_SWIZZLED_KERNEL[(triton.cdiv(padded_m, block_m), K // block_k)](
+            x,
+            xq,
+            scales,
+            M,
+            padded_m,
+            x.stride(0),
+            K=K,
+            BM=block_m,
+            BK=block_k,
+            LAUNCH_PDL=launch_pdl,
+            num_warps=num_warps,
+            launch_pdl=launch_pdl,
+        )
+    return xq, scales
+
+
 def _mxfp8_e4m3_quantize_impl(
     x: torch.Tensor,
     is_sf_swizzled_layout: bool = False,
@@ -191,6 +302,18 @@ def _mxfp8_e4m3_quantize_impl(
 ) -> tuple[torch.Tensor, torch.Tensor]:
     from vllm.platforms import current_platform
     from vllm.utils.flashinfer import has_flashinfer
+
+    if (
+        _TRITON_SWIZZLED_QUANT
+        and is_sf_swizzled_layout
+        and x.ndim == 2
+        and x.dtype == torch.bfloat16
+        and x.shape[1] % 128 == 0
+        and x.stride(1) == 1
+        and alignment in (0, 32)
+        and current_platform.is_cuda()
+    ):
+        return mxfp8_quantize_swizzled_triton(x)
 
     if current_platform.has_device_capability(100) and has_flashinfer():
         from flashinfer import mxfp8_quantize as flashinfer_mxfp8_quantize
