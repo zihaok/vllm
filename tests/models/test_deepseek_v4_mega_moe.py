@@ -1163,7 +1163,7 @@ def test_rubin_localization_preserves_parameters_and_reload(monkeypatch):
         ):
             if actual.ndim == 4:
                 actual = actual.movedim(0, -3).flatten(-3, -2)
-            assert torch.equal(actual, wanted)
+            assert torch.equal(actual.view(wanted.dtype), wanted)
 
     check(expected)
     ckpt = _load_mega_moe_checkpoint_shuffled(experts, 3, seed=1)
