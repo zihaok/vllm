@@ -3,14 +3,9 @@
 
 import torch
 
-from vllm.model_executor.kernels.attention.dsa.sparse_mqa_logits import has_deep_select
-from vllm.model_executor.layers.indexer_topk import (
-    deep_select_topk,
-    get_deep_select_stride_requirement,
-    is_deep_select_supported,
-)
+from vllm.model_executor.layers.indexer_topk import get_indexer_topk
+from vllm.platforms import current_platform
 from vllm.triton_utils import tl, triton
-from vllm.utils.math_utils import round_up
 
 
 @triton.jit
@@ -58,11 +53,8 @@ def _block_scores_kernel(
             other=-float("inf"),
         ).to(tl.float32)
         reduced = tl.reduce(values, 1, _max_with_nan)
-        # Pin the newest block. DeepSelect leaves NaN rows partially written,
-        # so also pin NaN blocks (torch.topk ranks NaN first too).
+        # Pin the newest block while preserving NaNs for the top-k backend.
         pinned = (end > start) & (blocks == (end - start - 1) // BLOCK_SIZE)
-        if not FULL_WIDTH:
-            pinned |= reduced != reduced
         reduced = tl.where(pinned, float("inf"), reduced)
         tl.store(scores + row * stride_scores + blocks, reduced, blocks < num_blocks)
 
@@ -176,20 +168,21 @@ def select_candidate_blocks(
         out.fill_(-1)
         return
     nblocks = triton.cdiv(width, block_size)
-    # Logits are max_model_len wide (CUDA-graph static) but rows are shorter:
-    # DeepSelect stops at each row's valid block count. Order does not matter.
-    use_deep_select = has_deep_select() and nblocks >= topk_blocks
-    if use_deep_select:
-        in_align, out_align = get_deep_select_stride_requirement()
-        padded = round_up(nblocks, in_align // logits.element_size())
-        scores = logits.new_empty((rows, padded))[:, :nblocks]
-        use_deep_select = (
-            out.stride(1) == 1
-            and out.stride(0) * out.element_size() % out_align == 0
-            and is_deep_select_supported(scores, topk_blocks)
-        )
-    else:
-        scores = logits.new_empty((rows, nblocks))
+    # Main can keep decode logits in BF16; widen only the reduced block scores.
+    score_dtype = (
+        torch.float32
+        if logits.dtype in (torch.float16, torch.bfloat16)
+        else logits.dtype
+    )
+    scores = logits.new_empty((rows, nblocks), dtype=score_dtype)
+    k = min(topk_blocks, nblocks)
+    use_indexer_topk = (
+        current_platform.is_cuda()
+        and scores.dtype == torch.float32
+        and topk_blocks == out.shape[1]
+        and topk_blocks in (512, 1024, 2048)
+        and topk_blocks <= nblocks
+    )
     valid_blocks = torch.empty(rows, dtype=torch.int32, device=logits.device)
     _block_scores_kernel[(rows, 32)](
         logits,
@@ -207,19 +200,23 @@ def select_candidate_blocks(
         row_ks is not None,
         row_repeat,
         TILE=128,
-        FULL_WIDTH=not use_deep_select,
+        FULL_WIDTH=not use_indexer_topk,
     )
-    if use_deep_select:
-        deep_select_topk(scores, topk_blocks, end=valid_blocks, output_idx=out)
-        return
-    # Keep the existing top-k tie behavior.
-    top = scores.topk(min(topk_blocks, nblocks), dim=-1)
+    if use_indexer_topk:
+        indices = torch.empty((rows, k), dtype=torch.int32, device=logits.device)
+        # Candidate masks only use membership; tied block IDs follow the
+        # existing backend's policy rather than torch.topk's tie order.
+        get_indexer_topk("auto")(scores, valid_blocks, 1, indices, k, nblocks)
+        values = scores.gather(1, indices.clamp_min(0).long())
+        values = values.masked_fill(indices < 0, -float("inf"))
+    else:
+        values, indices = scores.topk(k, dim=-1)
     _store_candidates_kernel[(rows, triton.cdiv(topk_blocks, 256))](
-        top.values,
-        top.indices,
+        values,
+        indices,
         out,
         *out.stride(),
-        top.values.shape[1],
+        k,
         topk_blocks,
         256,
     )
