@@ -339,13 +339,48 @@ def _flashinfer_autotune_token_counts(runner: "GPUModelRunner") -> tuple[int, ..
     return tuple(dict.fromkeys(token_counts))
 
 
+def _warmup_flashinfer_mxfp8_linears(runner: "GPUModelRunner", max_tokens: int) -> None:
+    """Tune projections that a short-context dummy forward may skip."""
+    import vllm.utils.flashinfer as fi_utils
+    from vllm.model_executor.kernels.linear import FlashInferCutedslMxfp8LinearKernel
+
+    linears: dict[
+        tuple[int, int, torch.dtype, torch.device],
+        tuple[torch.nn.Module, FlashInferCutedslMxfp8LinearKernel],
+    ] = {}
+    for module in runner.get_model().modules():
+        for holder_name in ("quant_method", "scheme"):
+            kernel = getattr(getattr(module, holder_name, None), "kernel", None)
+            if not isinstance(kernel, FlashInferCutedslMxfp8LinearKernel):
+                continue
+            # Direct kernel calls cannot materialize CPU-offloaded weights.
+            if module.weight.device.type != "cuda":
+                continue
+            n, k = kernel.config.weight_shape
+            key = (n, k, module.params_dtype, module.weight.device)
+            linears.setdefault(key, (module, kernel))
+    if not linears:
+        return
+
+    # GEMM serving lookups are uncapped (e.g. 8190 -> 8192). Expand only
+    # these synthetic GEMM profiles, preserving the other ops' token limits.
+    max_tokens = fi_utils.flashinfer_map_to_hybrid_bucket_uncapped(max_tokens)
+    tuning_buckets = fi_utils.flashinfer_get_hybrid_num_tokens_buckets(max_tokens)
+    with fi_utils.autotune(tuning_buckets=tuning_buckets, round_up=True):
+        for (_, k, dtype, device), (module, kernel) in linears.items():
+            # FlashInfer synthesizes every explicit M bucket from this input,
+            # checking each profile even when the one-row key is already cached.
+            x = torch.randn((1, k), dtype=dtype, device=device)
+            kernel.apply_weights(module, x)
+
+
 def _run_flashinfer_autotune_dummy_runs(
     runner: "GPUModelRunner", *, skip_attn: bool = False
 ) -> None:
     import vllm.utils.flashinfer as fi_utils
 
     dummy_run_kwargs = {"skip_attn": True} if skip_attn else {}
-    for num_tokens in _flashinfer_autotune_token_counts(runner):
+    for pass_index, num_tokens in enumerate(_flashinfer_autotune_token_counts(runner)):
         # The drafter may use more tokens than this pass in the same dummy run.
         # Include its max M when building the autotune buckets.
         max_tuning_tokens = num_tokens
@@ -379,6 +414,8 @@ def _run_flashinfer_autotune_dummy_runs(
                 randomize_inputs=True,
                 **dummy_run_kwargs,
             )
+            if pass_index == 0:
+                _warmup_flashinfer_mxfp8_linears(runner, max_tuning_tokens)
 
 
 def _autotune_cache_fingerprint(path: Path) -> tuple[str, int] | None:

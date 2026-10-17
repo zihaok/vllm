@@ -12,11 +12,13 @@ from typing import Any
 from unittest.mock import Mock, call, patch
 
 import pytest
+import torch
 
 from vllm.model_executor.warmup import kernel_warmup as warmup
 from vllm.model_executor.warmup.kernel_warmup import (
     _flashinfer_autotune_token_counts,
     _run_flashinfer_autotune_dummy_runs,
+    _warmup_flashinfer_mxfp8_linears,
     flashinfer_autotune,
 )
 
@@ -84,23 +86,24 @@ def test_flashinfer_autotune_token_counts_are_bounded_and_deduplicated():
 
 
 @pytest.mark.parametrize("skip_attn", [False, True])
-def test_flashinfer_autotune_uses_token_buckets_for_each_dummy_run(skip_attn):
+@pytest.mark.parametrize("max_tokens", [8190, 8192])
+def test_flashinfer_autotune_preserves_dummy_run_token_limit(skip_attn, max_tokens):
     from vllm.v1.worker.gpu.model_runner import GPUModelRunner as V2Runner
     from vllm.v1.worker.gpu_model_runner import GPUModelRunner as V1Runner
 
-    runner = _make_runner([])
+    runner = _make_runner([], max_tokens=max_tokens)
     dummy_run_signature = signature((V2Runner if skip_attn else V1Runner)._dummy_run)
     runner._dummy_run.side_effect = lambda **kwargs: dummy_run_signature.bind(
         None, **kwargs
     )
-    max_buckets = (1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024, 8192)
+    max_buckets = (1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024, max_tokens)
     deferred_buckets = (1, 2, 4, 8, 16, 32, 64, 128)
 
     with (
         patch(
             "vllm.model_executor.warmup.kernel_warmup."
             "_flashinfer_autotune_token_counts",
-            return_value=(8192, 128),
+            return_value=(max_tokens, 128),
         ),
         patch(
             "vllm.utils.flashinfer.flashinfer_get_hybrid_num_tokens_buckets",
@@ -110,14 +113,14 @@ def test_flashinfer_autotune_uses_token_buckets_for_each_dummy_run(skip_attn):
     ):
         _run_flashinfer_autotune_dummy_runs(runner, skip_attn=skip_attn)
 
-    assert get_buckets.call_args_list == [call(8192), call(128)]
+    assert get_buckets.call_args_list == [call(max_tokens), call(128)]
     assert autotune.call_args_list == [
         call(tuning_buckets=max_buckets, round_up=True),
         call(tuning_buckets=deferred_buckets, round_up=True),
     ]
     assert runner._dummy_run.call_args_list == [
         call(
-            num_tokens=8192,
+            num_tokens=max_tokens,
             skip_eplb=True,
             is_profile=True,
             randomize_inputs=True,
@@ -158,6 +161,69 @@ def test_flashinfer_autotune_buckets_cover_drafter_tokens():
         8192,
         128,
     ]
+
+
+def test_flashinfer_mxfp8_warmup_covers_skipped_projections_once_per_shape():
+    from vllm.model_executor.kernels.linear import FlashInferCutedslMxfp8LinearKernel
+
+    def linear(n, k, *, dtype=torch.bfloat16, device="cuda"):
+        kernel = Mock(spec=FlashInferCutedslMxfp8LinearKernel)
+        kernel.config = SimpleNamespace(weight_shape=(n, k))
+        holder = SimpleNamespace(kernel=kernel)
+        return SimpleNamespace(
+            weight=SimpleNamespace(device=torch.device(device)),
+            params_dtype=dtype,
+            quant_method=holder,
+            scheme=holder,
+        )
+
+    main_projection = linear(32768, 1280)
+    indexer_projection = linear(4096, 1280)
+    duplicate = linear(4096, 1280)
+    different_dtype = linear(4096, 1280, dtype=torch.float16)
+    offloaded = linear(4096, 1280, device="cpu")
+    unrelated = SimpleNamespace(quant_method=SimpleNamespace(kernel=Mock()))
+    runner = _make_runner(
+        [
+            main_projection,
+            indexer_projection,
+            duplicate,
+            different_dtype,
+            offloaded,
+            unrelated,
+        ]
+    )
+    cpu_randn = torch.randn
+    with (
+        patch.object(
+            warmup.torch,
+            "randn",
+            side_effect=lambda shape, *, dtype, device: cpu_randn(shape, dtype=dtype),
+        ),
+        patch(
+            "vllm.utils.flashinfer.flashinfer_map_to_hybrid_bucket_uncapped",
+            return_value=8192,
+        ),
+        patch(
+            "vllm.utils.flashinfer.flashinfer_get_hybrid_num_tokens_buckets",
+            return_value=(1, 8192),
+        ) as get_buckets,
+        patch("vllm.utils.flashinfer.autotune") as autotune,
+    ):
+        _warmup_flashinfer_mxfp8_linears(runner, 8190)
+
+    get_buckets.assert_called_once_with(8192)
+    autotune.assert_called_once_with(tuning_buckets=(1, 8192), round_up=True)
+    for module in (main_projection, indexer_projection, different_dtype):
+        apply = module.quant_method.kernel.apply_weights
+        apply.assert_called_once()
+        layer, activation = apply.call_args.args
+        assert layer is module
+        assert activation.shape == (1, 1280)
+        assert activation.dtype == module.params_dtype
+    for module in (duplicate, offloaded, unrelated):
+        module.quant_method.kernel.apply_weights.assert_not_called()
+    runner._dummy_run.assert_not_called()
 
 
 class _AutotuneGroup:
