@@ -3,6 +3,8 @@
 
 import torch
 
+from vllm.model_executor.layers.indexer_topk import get_indexer_topk
+from vllm.platforms import current_platform
 from vllm.triton_utils import tl, triton
 
 
@@ -27,11 +29,19 @@ def _block_scores_kernel(
     HAS_STARTS: tl.constexpr,
     ROW_REPEAT: tl.constexpr,
     TILE: tl.constexpr,
+    SKIP_TAIL: tl.constexpr = False,
 ):
     row = tl.program_id(0).to(tl.int64)
     blocks = tl.program_id(1) * TILE + tl.arange(0, TILE)
     start = tl.load(starts + row // ROW_REPEAT * stride_start) if HAS_STARTS else 0
     end = tl.load(ends + row // ROW_REPEAT * stride_end)
+    if SKIP_TAIL:
+        # The ragged top-k only reads live blocks, so skip padded tail tiles.
+        lim = tl.minimum(end, width)
+        live = tl.where(lim > start, (lim - start + BLOCK_SIZE - 1) // BLOCK_SIZE, 0)
+        pin = tl.where(end > start, (end - start - 1) // BLOCK_SIZE + 1, 0)
+        if tl.program_id(1) * TILE >= tl.maximum(live, pin):
+            return
     offsets = tl.arange(0, triton.next_power_of_2(BLOCK_SIZE))
     cols = start + blocks[:, None] * BLOCK_SIZE + offsets[None, :]
     values = tl.load(
@@ -161,6 +171,14 @@ def select_candidate_blocks(
         return
     nblocks = triton.cdiv(width, block_size)
     scores = logits.new_empty((rows, nblocks))
+    k = min(topk_blocks, nblocks)
+    use_indexer_topk = (
+        current_platform.is_cuda()
+        and scores.dtype == torch.float32
+        and topk_blocks == out.shape[1]
+        and topk_blocks in (512, 1024, 2048)
+        and topk_blocks <= nblocks
+    )
     _block_scores_kernel[(rows, triton.cdiv(nblocks, 128))](
         logits,
         row_ks,
@@ -175,15 +193,31 @@ def select_candidate_blocks(
         row_ks is not None,
         row_repeat,
         128,
+        SKIP_TAIL=use_indexer_topk,
     )
-    # Keep the existing top-k tie behavior.
-    top = scores.topk(min(topk_blocks, nblocks), dim=-1)
+    if use_indexer_topk:
+        lengths = row_ke if row_ks is None else row_ke - row_ks
+        block_lens = (
+            ((lengths + block_size - 1) // block_size)
+            .clamp(min=0, max=nblocks)
+            .to(torch.int32)
+        )
+        if row_repeat != 1:
+            block_lens = block_lens.repeat_interleave(row_repeat)
+        indices = torch.empty((rows, k), dtype=torch.int32, device=logits.device)
+        # Candidate masks only use membership; tied block IDs follow the
+        # existing backend's policy rather than torch.topk's tie order.
+        get_indexer_topk("auto")(scores, block_lens, 1, indices, k, nblocks)
+        values = scores.gather(1, indices.clamp_min(0).long())
+        values = values.masked_fill(indices < 0, -float("inf"))
+    else:
+        values, indices = scores.topk(k, dim=-1)
     _store_candidates_kernel[(rows, triton.cdiv(topk_blocks, 256))](
-        top.values,
-        top.indices,
+        values,
+        indices,
         out,
         *out.stride(),
-        top.values.shape[1],
+        k,
         topk_blocks,
         256,
     )
