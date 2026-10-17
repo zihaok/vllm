@@ -450,7 +450,9 @@ def test_candidate_kernels_preserve_packed_bounds_and_padding(
     lengths = ke - ks
     last = ((lengths - 1) // block_size).clamp(min=0).long()
     reduced.scatter_(
-        1, last[:, None], torch.where(lengths > 0, torch.inf, -torch.inf)[:, None]
+        1,
+        last[:, None],
+        torch.where(lengths > 0, torch.inf, -torch.inf).to(reduced.dtype)[:, None],
     )
     top = reduced.topk(min(k, nblocks), dim=-1)
     expected = torch.full((rows, k), -1, device="cuda", dtype=torch.int32)
@@ -520,7 +522,7 @@ def test_candidate_kernels_preserve_packed_bounds_and_padding(
         logits.fill_(3.0)
         graph.replay()
         keep = valid & (block >= 0) & ((cols - ks[:, None]) // block_size == block)
-        reference = torch.where(keep, 3.0, -torch.inf)
+        reference = torch.where(keep, 3.0, -torch.inf).to(logits.dtype)
         torch.testing.assert_close(logits, reference, rtol=0, atol=0)
 
 
