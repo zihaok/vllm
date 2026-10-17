@@ -395,34 +395,48 @@ def test_candidate_selection_keeps_valid_blocks_with_nan_scores(score, start):
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 @pytest.mark.parametrize(
-    "width,block_size,k,decode",
+    "width,block_size,k,decode,rows",
     [
-        (73, 8, 16, False),
-        (97, 3, 7, False),
-        (32768, 8, 2048, False),
-        (32768, 8, 2048, True),
+        (73, 8, 16, False, 6),
+        (97, 3, 7, False, 6),
+        (9000, 8, 512, False, 6),
+        (16384, 8, 1024, True, 96),
+        (32768, 8, 2048, False, 6),
+        (32768, 8, 2048, True, 6),
+        (32768, 8, 2048, False, 96),
+        (32768, 8, 2048, True, 96),
     ],
 )
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
 def test_candidate_kernels_preserve_packed_bounds_and_padding(
-    width, block_size, k, decode
+    monkeypatch, width, block_size, k, decode, rows, dtype
 ):
-    """Preserve top-k ties, newest blocks, empty rows and candidate clamping."""
+    """Preserve top-k values, newest blocks, padding and graph-replayed bounds."""
     from vllm.model_executor.kernels.attention.dsa.candidate_blocks import (
         apply_candidate_mask,
         select_candidate_blocks,
     )
+    from vllm.v1.worker import workspace
 
+    monkeypatch.setattr(
+        workspace, "_manager", workspace.WorkspaceManager(torch.device("cuda"))
+    )
     torch.manual_seed(42)
-    rows = 6
-    logits = torch.randn(rows, width * 2, device="cuda")[:, ::2]
+    logits = torch.randn(rows, width * 2, device="cuda").bfloat16().to(dtype)[:, ::2]
     logits[0, :16] = 0
     logits[2, 5] = float("nan")
-    starts = torch.tensor([0, 5, 3, 0, 7, 1], device="cuda", dtype=torch.int32)
-    ends = torch.tensor([0, width, width - 1, 1, 11, width], device="cuda")
+    starts = torch.tensor([0, 5, 3, 0, 7, 1], device="cuda", dtype=torch.int32).repeat(
+        rows // 6
+    )
+    ends = torch.tensor([0, width, width - 1, 1, 11, width], device="cuda").repeat(
+        rows // 6
+    )
     repeat = 1
     if decode:
         starts = None
-        ends = torch.tensor([0, 1, width], device="cuda", dtype=torch.int32)
+        ends = torch.tensor([0, 1, width], device="cuda", dtype=torch.int32).repeat(
+            rows // 6
+        )
         repeat = 2
     ks = torch.zeros(rows, device="cuda", dtype=torch.int64) if decode else starts
     ke = ends.repeat_interleave(repeat)
@@ -445,7 +459,37 @@ def test_candidate_kernels_preserve_packed_bounds_and_padding(
     ).int()
     actual = torch.empty(rows, k * 2, device="cuda", dtype=torch.int32)[:, ::2]
     select_candidate_blocks(logits, starts, ends, k, block_size, actual, repeat)
-    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+
+    def check_selection():
+        assert ((actual >= -1) & (actual < nblocks)).all()
+        ordered = actual.sort(dim=1).values
+        assert ((ordered[:, 1:] != ordered[:, :-1]) | (ordered[:, 1:] == -1)).all()
+        torch.testing.assert_close((actual >= 0).sum(1), (expected >= 0).sum(1))
+        selected = reduced.gather(1, actual.clamp_min(0).long())
+        selected = selected.masked_fill(actual < 0, -torch.inf)
+        expected_values = reduced.gather(1, expected.clamp_min(0).long())
+        expected_values = expected_values.masked_fill(expected < 0, -torch.inf)
+        # Different tied block IDs are valid; masks do not depend on ordering.
+        torch.testing.assert_close(
+            selected.sort(dim=1).values,
+            expected_values.sort(dim=1).values,
+            rtol=0,
+            atol=0,
+            equal_nan=True,
+        )
+        assert ((lengths == 0) | (actual == last[:, None]).any(dim=1)).all()
+
+    check_selection()
+    selection_graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(selection_graph):
+        select_candidate_blocks(logits, starts, ends, k, block_size, actual, repeat)
+    original_ends = ends.clone()
+    ends.zero_()
+    selection_graph.replay()
+    assert (actual == -1).all()
+    ends.copy_(original_ends)
+    selection_graph.replay()
+    check_selection()
 
     candidates = actual.clone()
     candidates[:, 0] = nblocks + 10
