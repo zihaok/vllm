@@ -41,7 +41,7 @@ def _make_moe(*, max_deferred_tokens: int = 128, enabled: bool = True):
     return moe
 
 
-def _make_runner(modules, *, max_tokens: int = 8192):
+def _make_runner(modules, *, draft_modules=None, max_tokens: int = 8192):
     """Create a runner carrying only the state used by FlashInfer warmup."""
     return SimpleNamespace(
         scheduler_config=SimpleNamespace(max_num_batched_tokens=max_tokens),
@@ -51,6 +51,13 @@ def _make_runner(modules, *, max_tokens: int = 8192):
         ),
         get_model=Mock(
             return_value=SimpleNamespace(modules=Mock(return_value=modules))
+        ),
+        get_draft_model=Mock(
+            return_value=(
+                None
+                if draft_modules is None
+                else SimpleNamespace(modules=Mock(return_value=draft_modules))
+            )
         ),
         _dummy_run=Mock(),
     )
@@ -179,19 +186,14 @@ def test_flashinfer_mxfp8_warmup_covers_skipped_projections_once_per_shape():
 
     main_projection = linear(32768, 1280)
     indexer_projection = linear(4096, 1280)
+    draft_projection = linear(5120, 15360)
     duplicate = linear(4096, 1280)
     different_dtype = linear(4096, 1280, dtype=torch.float16)
     offloaded = linear(4096, 1280, device="cpu")
     unrelated = SimpleNamespace(quant_method=SimpleNamespace(kernel=Mock()))
     runner = _make_runner(
-        [
-            main_projection,
-            indexer_projection,
-            duplicate,
-            different_dtype,
-            offloaded,
-            unrelated,
-        ]
+        [main_projection, indexer_projection, unrelated],
+        draft_modules=[draft_projection, duplicate, different_dtype, offloaded],
     )
     cpu_randn = torch.randn
     with (
@@ -214,15 +216,25 @@ def test_flashinfer_mxfp8_warmup_covers_skipped_projections_once_per_shape():
 
     get_buckets.assert_called_once_with(8192)
     autotune.assert_called_once_with(tuning_buckets=(1, 8192), round_up=True)
-    for module in (main_projection, indexer_projection, different_dtype):
+    for module in (
+        main_projection,
+        indexer_projection,
+        draft_projection,
+        different_dtype,
+    ):
         apply = module.quant_method.kernel.apply_weights
         apply.assert_called_once()
         layer, activation = apply.call_args.args
         assert layer is module
-        assert activation.shape == (1, 1280)
+        assert activation.shape == (
+            1,
+            module.quant_method.kernel.config.weight_shape[1],
+        )
         assert activation.dtype == module.params_dtype
     for module in (duplicate, offloaded, unrelated):
         module.quant_method.kernel.apply_weights.assert_not_called()
+    runner.get_model.assert_called_once_with()
+    runner.get_draft_model.assert_called_once_with()
     runner._dummy_run.assert_not_called()
 
 

@@ -340,7 +340,7 @@ def _flashinfer_autotune_token_counts(runner: "GPUModelRunner") -> tuple[int, ..
 
 
 def _warmup_flashinfer_mxfp8_linears(runner: "GPUModelRunner", max_tokens: int) -> None:
-    """Tune projections that a short-context dummy forward may skip."""
+    """Tune target and draft projections a short-context dummy forward may skip."""
     import vllm.utils.flashinfer as fi_utils
     from vllm.model_executor.kernels.linear import FlashInferCutedslMxfp8LinearKernel
 
@@ -348,17 +348,20 @@ def _warmup_flashinfer_mxfp8_linears(runner: "GPUModelRunner", max_tokens: int) 
         tuple[int, int, torch.dtype, torch.device],
         tuple[torch.nn.Module, FlashInferCutedslMxfp8LinearKernel],
     ] = {}
-    for module in runner.get_model().modules():
-        for holder_name in ("quant_method", "scheme"):
-            kernel = getattr(getattr(module, holder_name, None), "kernel", None)
-            if not isinstance(kernel, FlashInferCutedslMxfp8LinearKernel):
-                continue
-            # Direct kernel calls cannot materialize CPU-offloaded weights.
-            if module.weight.device.type != "cuda":
-                continue
-            n, k = kernel.config.weight_shape
-            key = (n, k, module.params_dtype, module.weight.device)
-            linears.setdefault(key, (module, kernel))
+    for model in (runner.get_model(), runner.get_draft_model()):
+        if model is None:
+            continue
+        for module in model.modules():
+            for holder_name in ("quant_method", "scheme"):
+                kernel = getattr(getattr(module, holder_name, None), "kernel", None)
+                if not isinstance(kernel, FlashInferCutedslMxfp8LinearKernel):
+                    continue
+                # Direct kernel calls cannot materialize CPU-offloaded weights.
+                if module.weight.device.type != "cuda":
+                    continue
+                n, k = kernel.config.weight_shape
+                key = (n, k, module.params_dtype, module.weight.device)
+                linears.setdefault(key, (module, kernel))
     if not linears:
         return
 
