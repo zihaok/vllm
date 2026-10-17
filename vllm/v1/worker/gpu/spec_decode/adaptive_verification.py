@@ -349,6 +349,26 @@ class AdaptiveVerificationManager:
         )
         return sum(num_non_draft_tokens_per_req.values()) + draft_budget
 
+    def refill_draft_budget(self, max_num_tokens: int) -> int:
+        """Refill a primed budget after agreeing on the DP-padded token count.
+
+        Only originally scheduled drafts are eligible. The caller must preserve
+        the agreed graph shape and per-request verification-width bounds.
+        """
+        batch_budget = self._batch_budget
+        assert batch_budget is not None
+        drafts, non_draft_tokens, draft_budget = batch_budget
+        num_non_draft_tokens = sum(non_draft_tokens.values())
+        new_budget = min(
+            sum(drafts.values()),
+            max(0, max_num_tokens - num_non_draft_tokens),
+            max(0, self._max_total_logits - len(drafts) * self.num_bonus_tokens),
+        )
+        if new_budget > draft_budget:
+            draft_budget = new_budget
+            self._batch_budget = (drafts, non_draft_tokens, draft_budget)
+        return num_non_draft_tokens + draft_budget
+
     def compact_batch(
         self,
         num_draft_tokens_per_req: np.ndarray,

@@ -266,6 +266,57 @@ def test_budget_caps_at_one_rejection_sampler_chunk():
     assert draft_budget <= 1
 
 
+@pytest.mark.parametrize(
+    ("padded_tokens", "max_logits", "expected_tokens"),
+    [
+        pytest.param(43, 7, 43, id="no-padding-headroom"),
+        pytest.param(45, 7, 45, id="refill-to-agreed-padding"),
+        pytest.param(64, 7, 46, id="only-original-drafts"),
+        pytest.param(64, 5, 44, id="one-rejection-chunk"),
+    ],
+)
+def test_refill_after_dp_agreement_preserves_scheduled_inputs(
+    padded_tokens, max_logits, expected_tokens
+):
+    manager = make_manager(
+        np.array([[0.9, 0.9], [0.9, 0.9], [1.0, 1.0]], dtype=np.float32),
+        np.array([1.0] * 44 + [100.0] * 3),
+    )
+    manager.req_states.req_id_to_index["prefill"] = 2
+    manager.req_states.num_computed_tokens_np = np.zeros(3, dtype=np.int32)
+    manager.req_states.prefill_len.np = np.array([0, 0, 60], dtype=np.int32)
+    manager._max_total_logits = max_logits
+    scheduled = {"low": 3, "high": 3, "prefill": 40}
+    drafts = {"low": [1, 2], "high": [3, 4]}
+    assert manager.get_num_tokens(scheduled, drafts) == 43
+
+    # Another rank can force a larger graph; only its unused token capacity
+    # becomes available, while logits and originally scheduled drafts stay capped.
+    assert manager.refill_draft_budget(padded_tokens) == expected_tokens
+    assert manager.refill_draft_budget(padded_tokens) == expected_tokens
+    counts = np.array([3, 3, 40], dtype=np.int32)
+    draft_counts = np.array([2, 2, 0], dtype=np.int32)
+    offsets = np.array([0, 3, 6, 7], dtype=np.int32)
+    compacted, _ = manager.compact_batch(draft_counts, counts, offsets)
+
+    assert int(compacted.sum()) == expected_tokens <= padded_tokens
+    assert compacted[2] == 40
+    assert (compacted[:2] <= 1 + manager.num_speculative_steps).all()
+    assert expected_tokens - 42 + 3 <= max_logits
+    assert scheduled == {"low": 3, "high": 3, "prefill": 40}
+    assert drafts == {"low": [1, 2], "high": [3, 4]}
+    np.testing.assert_array_equal(counts, [3, 3, 40])
+    np.testing.assert_array_equal(draft_counts, [2, 2, 0])
+    np.testing.assert_array_equal(offsets, [0, 3, 6, 7])
+
+
+def test_refill_requires_a_primed_budget():
+    manager = make_manager(np.ones((2, 2)), np.ones(7))
+    manager._batch_budget = None
+    with pytest.raises(AssertionError):
+        manager.refill_draft_budget(6)
+
+
 def test_zero_budget_rebuilds_cpu_cu_num_logits():
     # When one bonus row per request already overflows a verification chunk, the
     # budget clamps to zero but the batch still needs chunking. Every capacity is

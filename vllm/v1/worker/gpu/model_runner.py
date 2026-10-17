@@ -1815,6 +1815,41 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             empty_output = self.kv_connector.no_forward(scheduler_output)
             return self._merge_ec_connector_no_forward(scheduler_output, empty_output)
 
+        # Non-eager DP sync pads every rank to the agreed token count. Refill
+        # within that shape before constructing compacted input metadata.
+        if (
+            not dummy_run
+            and self.dp_size > 1
+            and self.adaptive_verification is not None
+            and batch_req_state is not None
+            and batch_req_state.num_draft_tokens_np is not None
+            and bool(scheduler_output.scheduled_spec_decode_tokens)
+            and dp_sync_state is not None
+            and not dp_sync_state.eager
+            and dp_sync_state.uniform_token_count is None
+            and batch_desc.cg_mode == CUDAGraphMode.PIECEWISE
+            and batch_desc.num_ubatches == 1
+            and batch_desc.uniform_token_count is None
+            and batch_desc.num_reqs is None
+            and batch_desc.max_query_len is None
+            and not self.use_pp
+            and self.pcp_manager is None
+            and self.dcp_size == 1
+            and all(
+                scheduled <= self.decode_query_len
+                for scheduled, drafts in zip(
+                    batch_req_state.num_scheduled_tokens,
+                    batch_req_state.num_draft_tokens_np,
+                    strict=True,
+                )
+                if drafts
+            )
+        ):
+            num_toks = self.adaptive_verification.refill_draft_budget(
+                min(batch_desc.num_tokens, self.max_num_tokens)
+            )
+            batch_req_state = batch_req_state._replace(num_tokens=num_toks)
+
         cudagraph_stats = None
         if not dummy_run:
             # Common case.
