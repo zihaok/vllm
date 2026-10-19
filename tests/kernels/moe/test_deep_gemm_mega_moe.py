@@ -310,68 +310,6 @@ def test_deep_gemm_mega_moe_reload_overwrites_kernel_layout_in_place(weight_form
     _assert_mega_moe_layout(experts, _expected_mega_moe_layout(ckpt, 2, 2))
 
 
-def test_flashinfer_sm107_reload_preserves_die_local_weights(monkeypatch):
-    """Shuffled loads preserve native weight bytes and die-local parameter storage."""
-    from vllm.model_executor.layers.fused_moe.flashinfer_sm107_mega_moe import (
-        FlashInferSM107MegaMoEExperts,
-    )
-
-    # Test checkpoint layout without requiring an SM107 locality allocator.
-    backend = SimpleNamespace(
-        is_localization_available=lambda: True,
-        get_unsupported_reason_for_mega_moe=lambda *args, **kwargs: None,
-        localize=lambda t: t.unflatten(-2, (2, -1)).movedim(-3, 0).contiguous(),
-    )
-    monkeypatch.setattr(
-        FlashInferSM107MegaMoEExperts, "_import_backend", staticmethod(lambda: backend)
-    )
-    monkeypatch.setattr(
-        "vllm.model_executor.layers.fused_moe.flashinfer_sm107_mega_moe.get_ep_group",
-        lambda: SimpleNamespace(world_size=1),
-    )
-    config = SimpleNamespace(
-        parallel_config=SimpleNamespace(enable_eplb=False),
-        scheduler_config=SimpleNamespace(max_num_batched_tokens=4),
-        compilation_config=SimpleNamespace(static_forward_context={}),
-    )
-    experts = FlashInferSM107MegaMoEExperts(
-        config,
-        num_experts=2,
-        num_local_experts=2,
-        experts_start_idx=0,
-        top_k=1,
-        hidden_size=256,
-        intermediate_size=384,
-        weight_format=MEGA_MOE_MXFP4,
-        activation=MegaMoEActivation(),
-    )
-    parameters = list(experts.parameters())
-    pointers = [param.data_ptr() for param in parameters]
-    for seed in (0, 1):
-        ckpt = _load_mega_moe_checkpoint_shuffled(experts, 2, seed)
-        expected = _reference_mega_moe_layout(
-            *(
-                ckpt[name]
-                for name in (
-                    "w13_weight",
-                    "w13_weight_scale",
-                    "w2_weight",
-                    "w2_weight_scale",
-                )
-            )
-        )
-        for actual, reference in zip(
-            (*experts.l1_weights, *experts.l2_weights), expected
-        ):
-            if actual.dim() == 4:
-                actual = actual.movedim(0, 1).flatten(1, 2)
-            assert torch.equal(actual.view(reference.dtype), reference)
-        assert all(a is b for a, b in zip(parameters, experts.parameters()))
-        assert [p.data_ptr() for p in experts.parameters()] == pointers
-    with pytest.raises(NotImplementedError, match="EPLB"):
-        experts.get_expert_weights()
-
-
 def test_deep_gemm_mega_moe_nvfp4_l2_scale_covers_every_expert():
     """Every rank quantizes L2 inputs with the max input scale over all experts,
     including those it does not own, so EPLB can move experts between ranks."""

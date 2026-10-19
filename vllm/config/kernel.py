@@ -125,7 +125,6 @@ MoEBackend = Literal[
     "batched_triton",
     "deep_gemm",
     "deep_gemm_mega_moe",
-    "sm107_deep_gemm_mega_moe_experimental",
     "cutlass",
     "flashinfer_trtllm",
     "flashinfer_cutlass",
@@ -149,7 +148,6 @@ MoEBackend = Literal[
 
 FLASHINFER_MOE_EP_CUTEDSL = "flashinfer_moe_ep_cutedsl"
 FLASHINFER_MOE_EP_DEEP_GEMM = "flashinfer_moe_ep_mega_deep_gemm"
-FLASHINFER_SM107_MEGA_MOE = "sm107_deep_gemm_mega_moe_experimental"
 
 # Backends implemented by the shared FlashInfer MoE-EP adapter.
 FLASHINFER_MOE_EP_BACKENDS = frozenset(
@@ -165,7 +163,7 @@ PASSTHROUGH_ALL2ALL_BACKEND: Final = "passthrough"
 # "Native" here meaning that the backend does not use the fused MoE path.
 # Currently only relevant for the vLLM provided DeepGEMM MegaMoE.,
 # TODO: migrate to the fused MoE path ultimately.
-NATIVE_MEGA_MOE_BACKENDS = frozenset({"deep_gemm_mega_moe", FLASHINFER_SM107_MEGA_MOE})
+NATIVE_MEGA_MOE_BACKENDS = frozenset({"deep_gemm_mega_moe"})
 
 # Every megakernel backend. The FlashInfer variants run through the standard
 # fused-MoE model path; the quantization method binds the kernel.
@@ -234,16 +232,12 @@ def validate_flashinfer_moe_ep_model(
     moe_backend: str, architectures: Iterable[str]
 ) -> None:
     """Reject model-specific FlashInfer MoE-EP backends."""
-    if moe_backend == FLASHINFER_SM107_MEGA_MOE:
-        supported = frozenset({"DeepseekV41ForCausalLM", "DSparkV41DraftModel"})
-    elif moe_backend == FLASHINFER_MOE_EP_DEEP_GEMM:
-        supported = FLASHINFER_MOE_EP_ARCHITECTURES
-    else:
+    if moe_backend != FLASHINFER_MOE_EP_DEEP_GEMM:
         return
-    if not any(arch in supported for arch in architectures):
+    if not any(arch in FLASHINFER_MOE_EP_ARCHITECTURES for arch in architectures):
         raise ValueError(
             f"moe_backend={moe_backend!r} is only supported for DeepSeek-V4 "
-            f"models ({sorted(supported)}), but the "
+            f"models ({sorted(FLASHINFER_MOE_EP_ARCHITECTURES)}), but the "
             f"model is {list(architectures)}."
         )
 
@@ -313,8 +307,6 @@ class KernelConfig:
       activation format ([E_local, max_num_tokens, K])
     - "deep_gemm": Use DeepGEMM kernels (FP8 block-quantized only)
     - "deep_gemm_mega_moe": Use DeepGEMM mega MoE kernels
-    - "sm107_deep_gemm_mega_moe_experimental": Use the experimental FlashInfer
-      CuTe DSL SM107 MegaMoE for DeepSeek-V4.1, with die-local routed weights
     - "cutlass": Use vLLM CUTLASS kernels
     - "flashinfer_trtllm": Use FlashInfer with TRTLLM-GEN kernels
     - "flashinfer_cutlass": Use FlashInfer with CUTLASS kernels

@@ -23,6 +23,7 @@ from vllm.distributed import get_ep_group
 from vllm.distributed.eplb.eplb_state import EplbLayerState
 from vllm.forward_context import get_forward_context, is_forward_context_available
 from vllm.logger import init_logger
+from vllm.model_executor.custom_op import PluggableLayer
 from vllm.model_executor.layers.fused_moe.prepare_megamoe import (
     prepare_megamoe_inputs,
     prepare_megamoe_nvfp4_inputs,
@@ -232,7 +233,8 @@ def _matches_weight_spec(linear: nn.Module, spec: MegaMoEWeightSpec) -> bool:
     )
 
 
-class DeepGemmMegaMoEExperts(nn.Module):
+@PluggableLayer.register("deep_gemm_mega_moe")
+class DeepGemmMegaMoEExperts(PluggableLayer):
     """Routed experts, and optionally the shared expert, as one MegaMoE launch.
 
     Parameters are registered in the kernel layout and every checkpoint shard is
