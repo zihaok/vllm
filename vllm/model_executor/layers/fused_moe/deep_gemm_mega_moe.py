@@ -383,10 +383,14 @@ class DeepGemmMegaMoEExperts(nn.Module):
         logger.warning_once("Disabling MegaMoE shared-expert fusion: %s.", reason)
         return 0, None
 
-    def _kernel_fuses_shared_experts(self, spec: MegaMoEWeightSpec) -> bool:
+    @staticmethod
+    def _import_backend():
         from vllm.utils.deep_gemm import _import_deep_gemm
 
-        deep_gemm = _import_deep_gemm()
+        return _import_deep_gemm()
+
+    def _kernel_fuses_shared_experts(self, spec: MegaMoEWeightSpec) -> bool:
+        deep_gemm = self._import_backend()
         fmt = self.weight_format
         buffer_api = "get_symm_buffer_for_mega_moe"
         block_m_api = "get_block_m_for_mega_moe"
@@ -604,9 +608,7 @@ class DeepGemmMegaMoEExperts(nn.Module):
         return dst, src.reshape(-1, 4, 2, 8, k)
 
     def get_symm_buffer(self):
-        from vllm.utils.deep_gemm import _import_deep_gemm
-
-        deep_gemm = _import_deep_gemm()
+        deep_gemm = self._import_backend()
         group = get_ep_group().device_group
         key = (
             id(group),
@@ -651,9 +653,7 @@ class DeepGemmMegaMoEExperts(nn.Module):
 
     def get_block_m(self, num_tokens: int) -> int:
         """BLOCK_M the MegaMoE scheduler runs ``num_tokens`` local tokens with."""
-        from vllm.utils.deep_gemm import _import_deep_gemm
-
-        deep_gemm = _import_deep_gemm()
+        deep_gemm = self._import_backend()
         args = (
             get_ep_group().world_size,
             self.num_experts,
@@ -783,9 +783,7 @@ class DeepGemmMegaMoEExperts(nn.Module):
                 else None,
             )
 
-        from vllm.utils.deep_gemm import _import_deep_gemm
-
-        deep_gemm = _import_deep_gemm()
+        deep_gemm = self._import_backend()
         fmt = self.weight_format
         symm_buffer = self.get_symm_buffer()
         shared_x_sf = None

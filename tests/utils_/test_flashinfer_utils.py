@@ -3,6 +3,7 @@
 import importlib.util
 from collections.abc import Iterator
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -58,3 +59,19 @@ def test_has_flashinfer_requires_ninja(
     _make_exe(tmp_path / "cuda" / "bin" / "nvcc")
     monkeypatch.setenv("PATH", str(tmp_path / "cuda" / "bin"))
     assert not fi.has_flashinfer()
+
+
+@pytest.mark.parametrize("legacy_class_available", [False, True])
+def test_one_sided_nvlink_requires_legacy_class(monkeypatch, legacy_class_available):
+    """A newer module without MoeAlltoAll must not break unrelated EP backends."""
+    module = SimpleNamespace(moe_a2a_get_workspace_size_per_rank=lambda: 0)
+    if legacy_class_available:
+        module.MoeAlltoAll = object
+    monkeypatch.setattr(fi, "has_flashinfer_comm", lambda: True)
+    monkeypatch.setattr(fi, "_get_submodule", lambda name: module)
+    monkeypatch.setattr(fi.importlib.util, "find_spec", lambda name: object())
+    fi.has_flashinfer_nvlink_one_sided.cache_clear()
+    try:
+        assert fi.has_flashinfer_nvlink_one_sided() is legacy_class_available
+    finally:
+        fi.has_flashinfer_nvlink_one_sided.cache_clear()
