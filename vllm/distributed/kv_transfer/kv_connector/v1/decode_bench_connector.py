@@ -648,17 +648,17 @@ class DecodeBenchConnectorWorker:
                 of a uint8 fp8 cache.
 
         """
-        # Convert block_ids to tensor on device
-        block_ids_tensor = torch.tensor(
-            block_ids, dtype=torch.long, device=kv_cache.device
-        )
-
-        # Filter invalid block IDs
-        valid_mask = block_ids_tensor < kv_cache.shape[0]
-        valid_block_ids = block_ids_tensor[valid_mask]
-
-        if len(valid_block_ids) == 0:
+        # Filter invalid block IDs on the host. Boolean-mask indexing on the device
+        # needs a blocking device-to-host copy of the selected count, which made the
+        # engine wait for the GPU on every new request (once per filled layer) and
+        # removed the host/GPU overlap of async scheduling.
+        num_blocks = kv_cache.shape[0]
+        valid_ids = [block_id for block_id in block_ids if block_id < num_blocks]
+        if not valid_ids:
             return
+        valid_block_ids = torch.tensor(valid_ids, dtype=torch.long, pin_memory=True).to(
+            kv_cache.device, non_blocking=True
+        )
 
         fill_values = self._make_fill_values(
             (len(valid_block_ids),) + kv_cache.shape[1:],
