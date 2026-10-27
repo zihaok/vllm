@@ -16,12 +16,14 @@ a single ``wo_a`` einsum covers the whole step.
 """
 
 from dataclasses import replace
+from functools import cached_property
 from typing import TYPE_CHECKING, cast
 
 import torch
 
 from vllm.config import VllmConfig
 from vllm.config.cache import CacheDType
+from vllm.config.compilation import CUDAGraphMode
 from vllm.forward_context import get_forward_context
 from vllm.model_executor.layers.fusion.quant_activation import QuantizedActivation
 from vllm.model_executor.layers.quantization.utils.quant_utils import kMxfp8Dynamic
@@ -37,6 +39,7 @@ from vllm.models.deepseek_v41.common.ops.fused_layout import (
     permute_on_load,
     q_fused_permutation,
 )
+from vllm.models.deepseek_v41.common.ops.query_quant import can_fuse_query_quant
 from vllm.models.deepseek_v41.nvidia.flashmla import DeepseekV4FlashMLAAttention
 from vllm.models.deepseek_v41.sparse_mla import (
     DeepseekV4FlashMLAMetadata,
@@ -44,7 +47,7 @@ from vllm.models.deepseek_v41.sparse_mla import (
 )
 from vllm.platforms import current_platform
 from vllm.utils.deep_gemm import fp8_einsum, get_tma_aligned_size
-from vllm.utils.math_utils import round_up
+from vllm.utils.math_utils import cdiv, round_up
 from vllm.v1.attention.ops.flashmla import is_flashmla_sparse_supported
 from vllm.v1.worker.workspace import current_workspace_manager
 
@@ -221,19 +224,46 @@ class DeepseekV4MegaAttnAttention(DeepseekV4FlashMLAAttention):
         einsum consumes the kernel's output with no repacking.
         """
         groups = self.n_local_groups
+        num_tokens = attn_out.data.shape[0]
+        quantize = self._can_quantize_o_proj
         z = torch.empty(
-            (attn_out.data.shape[0], groups, self.o_lora_rank),
-            dtype=torch.bfloat16,
+            (num_tokens, groups, self.o_lora_rank),
+            dtype=torch.float8_e4m3fn if quantize else torch.bfloat16,
             device=attn_out.data.device,
         )
+        if quantize:
+            # wo_a writes wo_b's MXFP8 input with F8_128x4 UE8M0 scales. Padded
+            # scale rows stay unwritten and only reach wo_b rows it never stores.
+            z_scale = torch.empty(
+                (cdiv(num_tokens, 128), groups * self.o_lora_rank // 128, 128),
+                dtype=torch.int32,
+                device=z.device,
+            )
         fp8_einsum(
             "bhr,hdr->bhd",
             (attn_out.data[:, :groups], attn_out.scale[:, :groups]),
             (self.wo_a.weight, self.wo_a.weight_scale),
-            z,
+            (z, z_scale) if quantize else z,
             recipe=self._einsum_recipe,
+            use_128x4_sfd_layout=quantize,
         )
-        return self._wo_b_proj(z.flatten(1))
+        z = z.flatten(1)
+        if not quantize:
+            return self._wo_b_proj(z)
+        scale = z_scale.view(-1).view(torch.uint8)
+        return self._wo_b_proj(
+            QuantizedActivation(z, scale, torch.bfloat16, z.shape, kMxfp8Dynamic)
+        )
+
+    @cached_property
+    def _can_quantize_o_proj(self) -> bool:
+        return (
+            self._einsum_recipe == (1, 1, 32)
+            and self.o_lora_rank % 128 == 0
+            # The fused GEMM + reduce-scatter takes a BF16 z only.
+            and self.gemm_rs is None
+            and can_fuse_query_quant([self.wo_b])
+        )
 
     # ---- forward -----------------------------------------------------------
 
@@ -244,7 +274,8 @@ class DeepseekV4MegaAttnAttention(DeepseekV4FlashMLAAttention):
         positions: torch.Tensor,
         output: QuantizedActivation,
     ) -> None:
-        attn_metadata = get_forward_context().attn_metadata
+        context = get_forward_context()
+        attn_metadata = context.attn_metadata
         if attn_metadata is None:
             # Warmup dummy run: reserve the prefill workspace, produce zeros.
             self._reserve_prefill_workspace(q)
@@ -265,7 +296,17 @@ class DeepseekV4MegaAttnAttention(DeepseekV4FlashMLAAttention):
             "DeepseekSparseSWAMetadata", attn_metadata[self.swa_cache_layer.prefix]
         )
         # The kernel takes int32 RoPE positions.
-        positions_int32 = positions.to(torch.int32)
+        if (
+            torch.cuda.is_current_stream_capturing()
+            and context.cudagraph_runtime_mode != CUDAGraphMode.PIECEWISE
+        ):
+            # Share across layers, but not across independent piecewise graphs.
+            cache = context.additional_kwargs.setdefault("mega_attn_positions", {})
+            if positions not in cache:
+                cache[positions] = positions.to(torch.int32)
+            positions_int32 = cache[positions]
+        else:
+            positions_int32 = positions.to(torch.int32)
         num_decode_tokens = swa_metadata.num_decode_tokens
 
         if swa_metadata.num_prefills > 0:

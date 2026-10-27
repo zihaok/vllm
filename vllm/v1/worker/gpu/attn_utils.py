@@ -497,8 +497,9 @@ def build_attn_metadata(
     # Also at capture, so FULL graphs share the batch-level buffers.
     cached_metadata: dict[tuple[KVCacheSpec, type], Any] = {}
     num_kv_cache_groups = len(kv_cache_config.kv_cache_groups)
+    filled: set[int] = set()
     for i in range(num_kv_cache_groups):
-        if not attn_groups[i]:
+        if not attn_groups[i] or i in filled:
             continue
         block_table = block_tables[i]
         slot_mapping = slot_mappings[i]
@@ -577,8 +578,58 @@ def build_attn_metadata(
                 cached_metadata[reuse_key] = metadata
             for layer_name in attn_group.layer_names:
                 attn_metadata[layer_name] = metadata
+            if not for_cudagraph_capture and hasattr(
+                attn_metadata_builder, "build_decode_siblings"
+            ):
+                # Later groups of the same spec take one batched launch, not builds.
+                filled |= _fill_sibling_groups(
+                    attn_metadata,
+                    attn_groups,
+                    i,
+                    attn_metadata_builder,
+                    metadata,
+                    block_tables,
+                    slot_mappings,
+                    ubatch_idx,
+                )
         token_to_req_indices = common_attn_metadata._token_to_req_indices_cache
     return attn_metadata
+
+
+def _fill_sibling_groups(
+    attn_metadata: dict[str, Any],
+    attn_groups: list[list[AttentionGroup]],
+    first: int,
+    builder: Any,
+    metadata: Any,
+    block_tables: Sequence[torch.Tensor],
+    slot_mappings: torch.Tensor,
+    ubatch_idx: int,
+) -> set[int]:
+    groups = [
+        j
+        for j in range(first + 1, len(attn_groups))
+        if len(attn_groups[j]) == 1
+        and type(attn_groups[j][0].get_metadata_builder(ubatch_idx)) is type(builder)
+        and attn_groups[j][0].kv_cache_spec == builder.kv_cache_spec
+    ]
+    if not groups:
+        return set()
+    siblings = [
+        (
+            attn_groups[j][0].get_metadata_builder(ubatch_idx),
+            block_tables[j],
+            slot_mappings[j],
+        )
+        for j in groups
+    ]
+    filled = builder.build_decode_siblings(metadata, siblings)
+    if filled is None:
+        return set()
+    for j, sibling_metadata in zip(groups, filled):
+        for layer_name in attn_groups[j][0].layer_names:
+            attn_metadata[layer_name] = sibling_metadata
+    return set(groups)
 
 
 def compute_mm_prefix_ranges(

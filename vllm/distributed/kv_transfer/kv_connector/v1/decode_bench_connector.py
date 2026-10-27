@@ -163,6 +163,16 @@ class DecodeBenchConnector(KVConnectorBase_V1, SupportsHMA):
                 vllm_config, kv_cache_config
             )
 
+    @property
+    def requires_block_hashes(self) -> bool:
+        # KV is addressed by block ID; Request.block_hashes is never read.
+        return False
+
+    @property
+    def supports_null_head_block_ids(self) -> bool:
+        # NewRequestData.block_ids is only read through yield_req_data.
+        return True
+
     # ==============================
     # Worker-side methods
     # ==============================

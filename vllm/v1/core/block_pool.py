@@ -429,7 +429,7 @@ class BlockPool:
             block_size,
             num_cached_blocks,
             parent_block_hash,
-            len(request.all_token_ids[start_token_idx:end_token_idx]),
+            min(end_token_idx, len(request.all_token_ids)) - start_token_idx,
             kv_cache_group_id,
         )
 
@@ -691,12 +691,15 @@ class BlockPool:
                 block.ref_cnt += 1
                 if self.metrics_collector:
                     self.metrics_collector.on_block_allocated(block)
-        else:
+        elif self.metrics_collector:
             for block in ret:
                 assert block.ref_cnt == 0
                 block.ref_cnt += 1
-                if self.metrics_collector:
-                    self.metrics_collector.on_block_allocated(block)
+                self.metrics_collector.on_block_allocated(block)
+        else:
+            # Blocks popped from the free queue have ref_cnt 0.
+            for block in ret:
+                block.ref_cnt = 1
         return ret
 
     def _notify_reuse(self, blocks: Iterable[KVCacheBlock]) -> None:

@@ -7,6 +7,7 @@ from collections.abc import Iterable
 from dataclasses import replace
 from typing import Any
 
+import vllm.envs as envs
 from vllm.compilation.cuda_graph import CUDAGraphStat
 from vllm.config import KVEventsConfig, VllmConfig
 from vllm.distributed.aux_output_connector.connector import AuxOutputSchedulerConnector
@@ -361,6 +362,12 @@ class Scheduler(SchedulerInterface):
 
         self.use_pp = self.parallel_config.pipeline_parallel_size > 1
         self.use_v2_model_runner = vllm_config.use_v2_model_runner
+        # Ship sliding-window null heads as counts unless a connector reads
+        # NewRequestData.block_ids itself.
+        self.skip_null_head_block_ids = self.use_v2_model_runner and (
+            self.connector is None
+            or getattr(self.connector, "supports_null_head_block_ids", False)
+        )
         # Scheduler iteration counter. Drives the V2+PP+async decode-throttle
         # cadence (`next_decode_eligible_step`).
         self.current_step = 0
@@ -403,6 +410,7 @@ class Scheduler(SchedulerInterface):
         )
 
         self.has_mamba_layers = kv_cache_config.has_mamba_layers
+        self.max_async_kv_admits_per_step = envs.VLLM_MAX_ASYNC_KV_ADMITS_PER_STEP
         self.needs_kv_cache_zeroing = kv_cache_config.needs_kv_cache_zeroing
         self.need_mamba_block_aligned_split = (
             self.has_mamba_layers and self.cache_config.mamba_cache_mode == "align"
@@ -964,6 +972,12 @@ class Scheduler(SchedulerInterface):
                 else:
                     step_skipped_waiting.appendleft(request_to_skip)
 
+            num_async_kv_admitted = 0
+            # In-flight prefill reservation: summed once per pass, then kept
+            # current as requests join _inflight_prefills below (nothing else
+            # changes their blocks in this loop), instead of re-summing every
+            # in-flight request on each async-KV admission.
+            inflight_reserved: int | None = None
             while token_budget > 0:
                 # Requests holding KV blocks are always drained first, and are
                 # the only ones admitted under PAUSED_NEW (e.g. async KV loads).
@@ -976,6 +990,11 @@ class Scheduler(SchedulerInterface):
                 # in `running` but still hold a model-runner request slot.
                 num_running = len(self.running) + self.num_waiting_for_streaming_input
                 if num_running >= self.max_num_active_reqs:
+                    break
+                if (
+                    request_queue is self.waiting
+                    and 0 < self.max_async_kv_admits_per_step <= num_async_kv_admitted
+                ):
                     break
 
                 request = request_queue.peek_request()
@@ -1300,10 +1319,9 @@ class Scheduler(SchedulerInterface):
                     # only if it fits in (free - other in-flight reservations)
                     # plus its own spec decode step blocks, to avoid deadlock and
                     # predictable preemptions.
-                    reserved_blocks = (
-                        self._inflight_prefill_reserved_blocks()
-                        + self._spec_decode_step_blocks
-                    )
+                    if inflight_reserved is None:
+                        inflight_reserved = self._inflight_prefill_reserved_blocks()
+                    reserved_blocks = inflight_reserved + self._spec_decode_step_blocks
 
                 # Replayed tokens are already counted in the adopted hit; a
                 # chunk that ends inside the replayed range needs no new slots.
@@ -1382,6 +1400,7 @@ class Scheduler(SchedulerInterface):
                     # If loading async, allocate memory and put request
                     # into the WAITING_FOR_REMOTE_KV state.
                     request.status = RequestStatus.WAITING_FOR_REMOTE_KVS
+                    num_async_kv_admitted += 1
                     # Set num_computed_tokens even though KVs are not yet loaded.
                     # request.num_computed_tokens will not be used anywhere until
                     # the request finished the KV transfer.
@@ -1397,6 +1416,8 @@ class Scheduler(SchedulerInterface):
                     # only the successfully loaded tokens.
                     request.num_computed_tokens = num_computed_tokens
                     self._inflight_prefills.add(request)
+                    if inflight_reserved is not None:
+                        inflight_reserved += self._request_remaining_blocks(request)
                     self._set_kv_fetch_stage(request, KV_FETCH_IN_PROGRESS)
                     skip_request(request_queue)
                     continue
@@ -1445,6 +1466,8 @@ class Scheduler(SchedulerInterface):
                 # Only track requests that will still be prefilling after this chunk.
                 if num_computed_tokens + num_new_tokens < request.num_tokens:
                     self._inflight_prefills.add(request)
+                    if inflight_reserved is not None:
+                        inflight_reserved += self._request_remaining_blocks(request)
                 # Encoder-related.
                 if encoder_inputs_to_schedule:
                     scheduled_encoder_inputs[request_id] = encoder_inputs_to_schedule
@@ -1496,15 +1519,23 @@ class Scheduler(SchedulerInterface):
         if self.use_v2_model_runner:
             scheduled_new_reqs.extend(scheduled_resumed_reqs)
             scheduled_resumed_reqs.clear()
-            new_reqs_data = [
-                NewRequestData.from_request(
-                    req,
-                    req_to_new_blocks[req.request_id].get_block_ids(),
-                    req._all_token_ids,
-                    uses_mrope=self.model_uses_mrope,
+            new_reqs_data = []
+            for req in scheduled_new_reqs:
+                new_blocks = req_to_new_blocks[req.request_id]
+                heads = None
+                if self.skip_null_head_block_ids:
+                    block_ids, heads = new_blocks.get_block_ids_after_null_head()
+                else:
+                    block_ids = new_blocks.get_block_ids()
+                new_reqs_data.append(
+                    NewRequestData.from_request(
+                        req,
+                        block_ids,
+                        req._all_token_ids,
+                        uses_mrope=self.model_uses_mrope,
+                        block_id_null_heads=heads,
+                    )
                 )
-                for req in scheduled_new_reqs
-            ]
         else:
             new_reqs_data = [
                 NewRequestData.from_request(

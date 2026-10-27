@@ -38,6 +38,7 @@ from vllm.v1.core.kv_cache_utils import (
 )
 from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.kv_cache_interface import (
+    CircularBufferSpec,
     FullAttentionSpec,
     MambaSpec,
     SlidingWindowSpec,
@@ -244,8 +245,6 @@ class SimpleCPUOffloadScheduler:
 
         # Store metadata
         self._lazy_mode = lazy_offload
-        # Lazy mode: use a cursor to track the last scanned block in the GPU free queue.
-        self._cursor: KVCacheBlock | None = None
         if self._lazy_mode:
             self._target_free = self._estimate_lazy_target_blocks(
                 kv_cache_config,
@@ -319,10 +318,20 @@ class SimpleCPUOffloadScheduler:
         """GPU blocks to keep available (free/offloaded) per step in lazy mode."""
         WATERMARK_RATIO = 1.0  # Reserve larger space to avoid running out of GPU blocks
         target = 0
-        for g in kv_cache_config.prefix_cacheable_groups:
+        cacheable = set(kv_cache_config.prefix_cacheable_group_ids)
+        for gid, g in enumerate(kv_cache_config.kv_cache_groups):
             spec = g.kv_cache_spec
             block_size = resolve_dcp_kv_block_size(spec, cp_world_size)
-            if isinstance(spec, MambaSpec):
+            if gid not in cacheable:
+                # All groups share the GPU free queue, so the walk must also cover
+                # the blocks that non-offloaded groups take from it each step when
+                # they grow with the tokens (ring buffers and Mamba state do not).
+                # Without this, DSV4.1 (8 sliding-window groups of 32 tokens, not
+                # prefix-cacheable) consumed ~25x the walk per step, and a prefix's
+                # first blocks were reallocated before being offloaded (0 CPU hits).
+                if not isinstance(spec, (MambaSpec, CircularBufferSpec)):
+                    target += cdiv(max_num_batched_tokens, block_size)
+            elif isinstance(spec, MambaSpec):
                 target += 2
             elif isinstance(spec, SlidingWindowSpec):
                 target += cdiv(spec.sliding_window, block_size) + 1
@@ -605,18 +614,15 @@ class SimpleCPUOffloadScheduler:
         cpu_pool = self.cpu_block_pool
         num_cpu_free = cpu_pool.get_num_free_blocks()
 
-        # Validate cursor: stale if block was removed from free queue.
-        if self._cursor is not None and self._cursor.ref_cnt > 0:
-            self._cursor = None
-
         gpu_ids: list[int] = []
-        last_visited = self._cursor
-
-        for covered, node in enumerate(free_queue.iter_blocks_after(self._cursor)):
+        # Walk from the head (the next blocks the allocator takes) and stop once
+        # target_free blocks there are free-or-offloaded. Resuming from a cursor
+        # instead kept advancing every step and offloaded blocks far from
+        # eviction, so the CPU tier filled with copies of GPU-resident blocks.
+        for covered, node in enumerate(free_queue.iter_blocks_after(None)):
             if covered >= self._target_free or len(gpu_ids) >= num_cpu_free:
                 break
 
-            last_visited = node
             bhash = node.block_hash
 
             if (
@@ -625,8 +631,6 @@ class SimpleCPUOffloadScheduler:
                 and cpu_pool.cached_block_hash_to_block.get_one_block(bhash) is None
             ):
                 gpu_ids.append(node.block_id)
-
-        self._cursor = last_visited
 
         # Batch-allocate CPU blocks.
         if gpu_ids:
@@ -1157,9 +1161,21 @@ class SimpleCPUOffloadScheduler:
 
         # Free CPU and GPU blocks' ref counts to turn them into prefix cache
         self.cpu_block_pool.free_blocks(cpu_blocks)
-        self._gpu_block_pool.free_blocks(
-            self._gpu_block_pool.blocks[bid] for bid in gpu_block_ids
-        )
+        if self._lazy_mode:
+            # Lazy stores take blocks from the head of the GPU free queue; return
+            # them there (in order) now that they are offloaded. free_blocks()
+            # would append them as most recently used and keep them on the GPU.
+            front = []
+            for bid in gpu_block_ids:
+                block = self._gpu_block_pool.blocks[bid]
+                block.ref_cnt -= 1
+                if block.ref_cnt == 0:
+                    front.append(block)
+            self._gpu_block_pool.free_block_queue.prepend_n(front)
+        else:
+            self._gpu_block_pool.free_blocks(
+                self._gpu_block_pool.blocks[bid] for bid in gpu_block_ids
+            )
 
     def _release_transfer_refs(self, transfer: TransferMeta) -> None:
         """Release transfer refs without making copied data cacheable."""
@@ -1421,7 +1437,6 @@ class SimpleCPUOffloadScheduler:
             for event_idx, count in self._store_event_pending_counts.items()
             if event_idx in self._abandoned_store_event_to_blocks
         }
-        self._cursor = None
         # Seed the fresh counters with outcomes since the last drain so a
         # mid-interval reset() does not drop them from the next report.
         undrained = BoundaryStoreStats(

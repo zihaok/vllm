@@ -14,7 +14,12 @@ from vllm.v1.core.kv_cache_coordinator import (
     get_kv_cache_coordinator,
 )
 from vllm.v1.core.kv_cache_metrics import KVCacheMetricsCollector
-from vllm.v1.core.kv_cache_utils import KVCacheBlock, KVCacheBlockCopy, trim_null_head
+from vllm.v1.core.kv_cache_utils import (
+    KVCacheBlock,
+    KVCacheBlockCopy,
+    null_head_len,
+    trim_null_head,
+)
 from vllm.v1.core.single_type_kv_cache_manager import MambaManager
 from vllm.v1.kv_cache_interface import (
     AttentionSpec,
@@ -106,6 +111,18 @@ class KVCacheBlocks:
             return None
         return tuple([blk.block_id for blk in group] for group in groups)
 
+    def get_block_ids_after_null_head(
+        self,
+    ) -> tuple[tuple[list[int], ...], tuple[int, ...]]:
+        """Like get_block_ids(), but each group's leading null blocks are counted
+        instead of listed: returns (block ids after the head, head lengths)."""
+        heads = tuple(null_head_len(group) for group in self.blocks)
+        ids = tuple(
+            [blk.block_id for blk in group[head:]]
+            for group, head in zip(self.blocks, heads)
+        )
+        return ids, heads
+
     def get_unhashed_block_ids(self) -> list[int]:
         """Get block_ids of unhashed blocks from KVCacheBlocks instance."""
         assert len(self.blocks) == 1, "Only one group is supported"
@@ -118,7 +135,7 @@ class KVCacheBlocks:
             [
                 block.block_id
                 for block in trim_null_head(group)
-                if block.block_hash is None and not block.is_null
+                if block._block_hash is None and not block.is_null
             ]
             for group in self.blocks
         ]

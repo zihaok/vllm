@@ -106,6 +106,10 @@ from vllm.version import __version__ as VLLM_VERSION
 
 logger = init_logger(__name__)
 
+# ADD requests at least this large (~65K prompt tokens) are decoded only while
+# the busy loop is blocked; see EngineCore._loop_blocked.
+_YIELD_MIN_REQUEST_BYTES = 256 * 1024
+
 
 HANDSHAKE_TIMEOUT_MINS = 5
 
@@ -218,6 +222,11 @@ class EngineCore:
         # schedule and execute batches, and is required by pipeline parallelism
         # to eliminate pipeline bubbles.
         self.batch_queue_size = vllm_config.max_concurrent_batches
+        # Set while the busy loop is blocked (on a step's result, on input, or on a
+        # DP collective). The input thread decodes long prompts in those windows,
+        # keeping its GIL-holding work off the result -> schedule -> send chain.
+        self._loop_blocked = threading.Event()
+        self._loop_blocked.set()
         self.batch_queue: (
             deque[tuple[Future[ModelRunnerOutput], SchedulerOutput, Future[Any]]] | None
         ) = None
@@ -229,7 +238,10 @@ class EngineCore:
         self.is_pooling_model = vllm_config.model_config.runner_type == "pooling"
 
         self.request_block_hasher: Callable[[Request], list[BlockHash]] | None = None
-        if vllm_config.cache_config.enable_prefix_caching or kv_connector is not None:
+        if vllm_config.cache_config.enable_prefix_caching or (
+            kv_connector is not None
+            and getattr(kv_connector, "requires_block_hashes", True)
+        ):
             caching_hash_fn = get_hash_fn_by_name(
                 vllm_config.cache_config.prefix_caching_hash_algo
             )
@@ -654,6 +666,14 @@ class EngineCore:
         Overridden by the DP engine core; never throttles otherwise."""
         return False
 
+    @contextmanager
+    def _preprocessing_window(self):
+        self._loop_blocked.set()
+        try:
+            yield
+        finally:
+            self._loop_blocked.clear()
+
     def step(self) -> tuple[dict[int, EngineCoreOutputs], bool]:
         """Schedule, execute, and make output.
 
@@ -670,6 +690,7 @@ class EngineCore:
         with (
             self.capture_iteration_details(scheduler_output) as iteration_details,
             self.log_error_detail(scheduler_output),
+            self._preprocessing_window(),
         ):
             model_output = future.result()
             if model_output is None:
@@ -770,7 +791,8 @@ class EngineCore:
             self.capture_iteration_details(scheduler_output) as iteration_details,
             self.log_error_detail(scheduler_output),
         ):
-            model_output = future.result()
+            with self._preprocessing_window():
+                model_output = future.result()
             if model_output is None:
                 # None from sample_tokens() implies that the original execute_model()
                 # call failed - raise that exception.
@@ -1043,7 +1065,8 @@ class EngineCore:
         return self.is_scheduler_paused() or self.model_executor.is_sleeping
 
     def execute_dummy_batch(self):
-        self.model_executor.execute_dummy_batch()
+        with self._preprocessing_window():
+            self.model_executor.execute_dummy_batch()
 
     def compute_weight_checksums(self) -> list[dict[str, str]]:
         return self.collective_rpc("compute_weight_checksums")
@@ -1618,7 +1641,8 @@ class EngineCoreProc(EngineCore):
                     waited = True
             block = self.process_input_queue_block
             try:
-                req = self.input_queue.get(block=block)
+                with self._preprocessing_window():
+                    req = self.input_queue.get(block=block)
                 self._handle_client_request(*req)
             except queue.Empty:
                 break
@@ -1934,6 +1958,13 @@ class EngineCoreProc(EngineCore):
                     # Deserialize the request data.
                     request: Any
                     if request_type == EngineCoreRequestType.ADD:
+                        # Decoding a long prompt holds the GIL for milliseconds; do
+                        # it while the busy loop is blocked (bounded wait).
+                        if (
+                            sum(f.buffer.nbytes for f in data_frames)
+                            > _YIELD_MIN_REQUEST_BYTES
+                        ):
+                            self._loop_blocked.wait(timeout=0.05)
                         req: EngineCoreRequest = add_request_decoder.decode(data_frames)
                         try:
                             request = self.preprocess_add_request(req)
@@ -2411,9 +2442,10 @@ class DPEngineCoreProc(EngineCoreProc):
                         )
 
             # 3) All-reduce operation to determine global unfinished reqs.
-            self.engines_running = self._has_global_unfinished_reqs(
-                local_unfinished_reqs
-            )
+            with self._preprocessing_window():
+                self.engines_running = self._has_global_unfinished_reqs(
+                    local_unfinished_reqs
+                )
 
             if not self.engines_running:
                 if self.dp_rank == 0 or not self.has_coordinator:

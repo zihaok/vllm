@@ -8,6 +8,7 @@ from typing import TYPE_CHECKING
 
 from vllm.config.ec_manager_config import EncoderCacheManagerMetadata
 from vllm.multimodal.utils import strip_covered_mm_data
+from vllm.v1.token_buffer import TokenBuffer
 
 if TYPE_CHECKING:
     import numpy as np
@@ -40,7 +41,7 @@ else:
 @dataclass
 class NewRequestData:
     req_id: str
-    prompt_token_ids: list[int] | None
+    prompt_token_ids: TokenBuffer | None
     mm_features: list[MultiModalFeatureSpec]
     sampling_params: SamplingParams | None
     pooling_params: PoolingParams | None
@@ -51,9 +52,11 @@ class NewRequestData:
     prompt_is_token_ids: list[bool] | None = None
 
     # Only used for v2 model runner.
-    prefill_token_ids: list[int] | None = None
+    prefill_token_ids: TokenBuffer | None = None
     # DeepSeek-V4.1 only: SWA bounded replay; see Request.replay_start.
     replay_start: int = 0
+    # Per group, the number of leading null blocks left out of block_ids.
+    block_id_null_heads: tuple[int, ...] | None = None
 
     @classmethod
     def from_request(
@@ -62,10 +65,25 @@ class NewRequestData:
         block_ids: tuple[list[int], ...],
         prefill_token_ids: list[int] | None = None,
         uses_mrope: bool = False,
+        block_id_null_heads: tuple[int, ...] | None = None,
     ) -> "NewRequestData":
+        # Snapshots: the request's buffers can grow or shrink (streaming input)
+        # before a worker consumes this message. Each is a memcpy.
+        prompt = request.prompt_token_ids
+        if prompt is not None:
+            prompt = TokenBuffer(prompt)
+        prefill = None
+        if prefill_token_ids is not None:
+            # Still the prompt (no outputs, no placeholder zeroing): ship it once.
+            same = (
+                prompt is not None
+                and request.prompt_is_token_ids is None
+                and len(prefill_token_ids) == len(prompt)
+            )
+            prefill = prompt if same else TokenBuffer(prefill_token_ids)
         return cls(
             req_id=request.request_id,
-            prompt_token_ids=request.prompt_token_ids,
+            prompt_token_ids=prompt,
             mm_features=strip_covered_mm_data(
                 request.mm_features,
                 request.num_computed_tokens,
@@ -78,8 +96,18 @@ class NewRequestData:
             lora_request=request.lora_request,
             prompt_embeds=request.prompt_embeds,
             prompt_is_token_ids=request.prompt_is_token_ids,
-            prefill_token_ids=prefill_token_ids,
+            prefill_token_ids=prefill,
             replay_start=request.replay_start,
+            block_id_null_heads=block_id_null_heads,
+        )
+
+    def full_block_ids(self) -> tuple[list[int], ...]:
+        """block_ids with the null heads restored (null block id 0)."""
+        if self.block_id_null_heads is None:
+            return self.block_ids
+        return tuple(
+            [0] * head + ids
+            for ids, head in zip(self.block_ids, self.block_id_null_heads)
         )
 
     @property

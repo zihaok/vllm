@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Any, ClassVar, cast
 
 import torch
@@ -789,6 +789,84 @@ class DeepseekSparseSWAMetadataBuilder(AttentionMetadataBuilder):
             **deepseek_v4_fields,  # type: ignore[arg-type]
         )
 
+    def build_decode_siblings(
+        self,
+        metadata: DeepseekSparseSWAMetadata,
+        siblings: list[tuple["DeepseekSparseSWAMetadataBuilder", torch.Tensor, torch.Tensor]],
+    ) -> list[DeepseekSparseSWAMetadata] | None:
+        """Fill same-spec SWA groups from this group's causal decode metadata.
+
+        One launch writes every sibling's is_valid_token, decode_swa_lens and
+        decode_swa_indices, the buffers its build() would write; None if unsupported.
+        """
+        n = metadata.num_decode_tokens
+        if (
+            not n
+            or metadata.num_prefill_tokens
+            or metadata.decode_swa_width != self.window_size
+            or self.max_image_tokens
+            or any(
+                b.window_size != self.window_size or b.block_size != self.block_size
+                for b, _, _ in siblings
+            )
+        ):
+            return None
+        key = tuple(
+            (
+                b.decode_swa_indices.data_ptr(),
+                b.decode_swa_lens.data_ptr(),
+                b.is_valid_token.data_ptr(),
+                block_table.data_ptr(),
+                block_table.stride(0),
+                slot_mapping.data_ptr(),
+            )
+            for b, block_table, slot_mapping in siblings
+        )
+        if getattr(self, "_sibling_key", None) != key:
+            table = torch.tensor(key, dtype=torch.int64).T.contiguous()
+            self._sibling_ptrs = table.to(self.device)
+            self._sibling_key = key
+        ptrs = self._sibling_ptrs
+        num_tokens = metadata.slot_mapping.shape[0]
+        _batched_decode_swa_kernel[(self.decode_swa_lens.shape[0], len(siblings))](
+            ptrs[0],
+            ptrs[1],
+            ptrs[2],
+            ptrs[3],
+            ptrs[4],
+            ptrs[5],
+            metadata.query_start_loc,
+            metadata.seq_lens,
+            metadata.token_to_req_indices,
+            metadata.replay_start,
+            n,
+            num_tokens,
+            self.decode_swa_indices.stride(0),
+            WINDOW=self.window_size,
+            BLOCK_SIZE=self.block_size,
+            WINDOW_BLOCK=next_power_of_2(self.window_size),
+        )
+        out = []
+        for b, block_table, slot_mapping in siblings:
+            tile_sched = b.build_tile_scheduler(n)
+            out.append(
+                replace(
+                    metadata,
+                    block_table=block_table,
+                    slot_mapping=slot_mapping,
+                    is_valid_token=b.is_valid_token[:num_tokens],
+                    decode_swa_indices=b.decode_swa_indices[:n],
+                    decode_swa_lens=b.decode_swa_lens[:n],
+                    tile_sched_swaonly=tile_sched[_LAYER_TYPE_SWAONLY],
+                    tile_sched_c4a=tile_sched[_LAYER_TYPE_C4A],
+                    tile_sched_c128a=tile_sched[_LAYER_TYPE_C128A],
+                    tile_sched_c1a=tile_sched[_LAYER_TYPE_C1A],
+                    tile_sched_c2a=tile_sched[_LAYER_TYPE_C2A],
+                    flashinfer_sparse_index_cache={},
+                )
+            )
+        return out
+
     def _build_image_visibility(
         self,
         num_reqs: int,
@@ -1127,6 +1205,59 @@ def _compute_swa_indices_and_lens_kernel(
             slot_ids,
             mask=offset < index_width,
         )
+
+
+@triton.jit(do_not_specialize=["num_decode_tokens", "num_tokens"])
+def _batched_decode_swa_kernel(
+    indices_ptrs,
+    lens_ptrs,
+    valid_ptrs,
+    block_table_ptrs,
+    block_table_strides,
+    slot_mapping_ptrs,
+    query_start_loc_ptr,
+    seq_lens_ptr,
+    token_to_req_indices_ptr,
+    replay_start_ptr,
+    num_decode_tokens,
+    num_tokens,
+    indices_stride,
+    WINDOW: tl.constexpr,
+    BLOCK_SIZE: tl.constexpr,
+    WINDOW_BLOCK: tl.constexpr,
+):
+    """Causal decode SWA metadata of one (token, group); groups come from pointer tables."""
+    tok = tl.program_id(0)
+    g = tl.program_id(1)
+    lens = tl.load(lens_ptrs + g).to(tl.pointer_type(tl.int32))
+    slots = tl.load(slot_mapping_ptrs + g).to(tl.pointer_type(tl.int64))
+    is_valid = tl.load(slots + tok, mask=tok < num_tokens, other=-1) >= 0
+    if tok < num_tokens:
+        valid = tl.load(valid_ptrs + g).to(tl.pointer_type(tl.int8))
+        tl.store(valid + tok, is_valid.to(tl.int8))
+    if tok >= num_decode_tokens:
+        tl.store(lens + tok, 0)
+        return
+    cols = tl.arange(0, WINDOW_BLOCK)
+    indices = tl.load(indices_ptrs + g).to(tl.pointer_type(tl.int32)) + tok * indices_stride
+    if not is_valid:
+        tl.store(lens + tok, 0)
+        tl.store(indices + cols, -1, mask=cols < WINDOW)
+        return
+    req = tl.load(token_to_req_indices_ptr + tok)
+    query_start = tl.load(query_start_loc_ptr + req)
+    query_len = tl.load(query_start_loc_ptr + req + 1) - query_start
+    pos = tl.load(seq_lens_ptr + req) - query_len + tok - query_start
+    start = tl.maximum(pos - (WINDOW - 1), 0)
+    start = tl.maximum(start, tl.load(replay_start_ptr + req))
+    swa_len = pos + 1 - start
+    tl.store(lens + tok, swa_len)
+    block_table = tl.load(block_table_ptrs + g).to(tl.pointer_type(tl.int32))
+    stride = tl.load(block_table_strides + g)
+    p = start + cols
+    blocks = tl.load(block_table + req * stride + p // BLOCK_SIZE, mask=cols < swa_len)
+    out = tl.where(cols < swa_len, blocks * BLOCK_SIZE + p % BLOCK_SIZE, -1)
+    tl.store(indices + cols, out, mask=cols < WINDOW)
 
 
 class ComputeSWAIndicesAndLensKernel(

@@ -300,6 +300,7 @@ if TYPE_CHECKING:
     VLLM_USE_NCCL_SYMM_MEM: bool = False
     VLLM_NCCL_INCLUDE_PATH: str | None = None
     VLLM_GC_DEBUG: str = ""
+    VLLM_MAX_ASYNC_KV_ADMITS_PER_STEP: int = 0
     VLLM_DEBUG_WORKSPACE: bool = False
     VLLM_DISABLE_SHARED_EXPERTS_STREAM: bool = False
     VLLM_DISABLE_DSV4_MEGAMOE_SHARED_EXPERT_FUSION: bool = False
@@ -2090,6 +2091,14 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # - VLLM_GC_DEBUG='{"top_objects":5}': enable GC debugger with
     #                                      top 5 collected objects
     "VLLM_GC_DEBUG": lambda: os.getenv("VLLM_GC_DEBUG", ""),
+    # Max number of new async KV loads (KV connector, e.g. P/D decode) the
+    # scheduler starts per step (0: no limit). An async-load admission does not
+    # take a running slot, so once one slot frees the scheduler would otherwise
+    # allocate KV for the whole waiting queue in one step (100+ ms for long
+    # prompts), stalling every data-parallel rank.
+    "VLLM_MAX_ASYNC_KV_ADMITS_PER_STEP": lambda: int(
+        os.getenv("VLLM_MAX_ASYNC_KV_ADMITS_PER_STEP", "0")
+    ),
     # Debug workspace allocations.
     # logging of workspace resize operations.
     "VLLM_DEBUG_WORKSPACE": lambda: bool(int(os.getenv("VLLM_DEBUG_WORKSPACE", "0"))),

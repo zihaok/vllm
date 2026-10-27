@@ -81,6 +81,16 @@ class NixlBaseConnector(KVConnectorBase_V1, SupportsHMA):
     _cache_hit_source = CacheHitSource.P2P
 
     @property
+    def requires_block_hashes(self) -> bool:
+        # KV is addressed by block ID; Request.block_hashes is never read.
+        return False
+
+    @property
+    def supports_null_head_block_ids(self) -> bool:
+        # NewRequestData.block_ids is only read through yield_req_data.
+        return True
+
+    @property
     def supports_divergent_local_hybrid_hits(self) -> bool:
         return True
 
