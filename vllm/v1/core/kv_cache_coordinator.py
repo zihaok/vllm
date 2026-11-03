@@ -182,6 +182,12 @@ class KVCacheCoordinator(ABC):
         self.group_block_sizes = tuple(
             manager.block_size for manager in self.single_type_managers
         )
+        # isinstance() against the ABC costs a Python-level __instancecheck__;
+        # resolve it once instead of per request and group on every step.
+        self._is_cross_attn = tuple(
+            isinstance(manager, CrossAttentionManager)
+            for manager in self.single_type_managers
+        )
 
         # A positive retention interval must be a multiple of the base hit granularity
         # (``scheduler_block_size``) to land on real cache-hit boundaries.
@@ -237,7 +243,7 @@ class KVCacheCoordinator(ABC):
         if self.retention_interval != 0:
             prefill_end = 0
         for i, manager in enumerate(self.single_type_managers):
-            if isinstance(manager, CrossAttentionManager):
+            if self._is_cross_attn[i]:
                 # For cross-attention, we issue a single static allocation
                 # of blocks based on the number of encoder input tokens.
                 num_blocks_to_allocate += manager.get_num_blocks_to_allocate(
@@ -339,12 +345,12 @@ class KVCacheCoordinator(ABC):
         return tuple(
             manager.allocate_new_blocks(
                 request_id,
-                num_encoder_tokens
-                if isinstance(manager, CrossAttentionManager)
-                else num_tokens,
+                num_encoder_tokens if is_cross_attn else num_tokens,
                 num_tokens_main_model,
             )
-            for manager in self.single_type_managers
+            for manager, is_cross_attn in zip(
+                self.single_type_managers, self._is_cross_attn
+            )
         )
 
     def get_num_cacheable_tokens(
