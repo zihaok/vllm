@@ -25,6 +25,7 @@ from vllm.forward_context import get_forward_context, is_forward_context_availab
 from vllm.logger import init_logger
 from vllm.model_executor.custom_op import PluggableLayer
 from vllm.model_executor.layers.fused_moe.prepare_megamoe import (
+    _eplb_kernel_args,
     prepare_megamoe_inputs,
     prepare_megamoe_nvfp4_inputs,
 )
@@ -829,6 +830,117 @@ class DeepGemmMegaMoEExperts(PluggableLayer):
             kwargs["shared_l2_weights"] = self._kernel_weights("shared_l2")
         y = torch.empty_like(hidden_states, dtype=torch.bfloat16)
         getattr(deep_gemm, fmt.kernel)(
+            y,
+            self.l1_weights,
+            self.l2_weights,
+            symm_buffer,
+            fast_math=self.fast_math,
+            **kwargs,
+        )
+        if shared_experts is not None:
+            y += shared_experts(hidden_states)
+        return y
+
+    def supports_fused_front(self) -> bool:
+        """Whether :meth:`forward_fused_front` serves this layer.
+
+        The fused front stages MXFP8 hidden states with UE8M0 group-32 scales,
+        which is the hidden quantization of the MXFP4 and MXFP8 formats.
+        """
+        from vllm.utils.deep_gemm import has_bf16_mega_gate_front
+
+        fmt = self.weight_format
+        return (
+            not fmt.uses_nvfp4_api
+            and fmt.hidden_quant == kMxfp8Dynamic
+            and has_bf16_mega_gate_front()
+        )
+
+    def forward_fused_front(
+        self,
+        hidden_states: torch.Tensor,
+        gate_weight: torch.Tensor,
+        gate_bias: torch.Tensor,
+        num_topk: int,
+        *,
+        scoring_func: str,
+        routed_scaling_factor: float,
+        ep_rank: int,
+        shared_experts: nn.Module | None = None,
+    ) -> torch.Tensor:
+        """Gate + MXFP8 staging + EPLB map/record in one launch, then the experts.
+
+        The same outputs as ``bf16_mega_gate`` followed by :meth:`forward`:
+        DeepGEMM's ``bf16_mega_gate_front`` writes the
+        physical top-k ids, the weights, the MXFP8 hidden states and their
+        scales straight into the symmetric buffer that the MegaMoE kernel reads.
+        """
+        from vllm.utils.deep_gemm import bf16_mega_gate_front
+
+        if shared_experts is not None and self.has_fused_shared_experts:
+            raise ValueError(
+                f"{self.prefix} fuses the shared expert into MegaMoE; "
+                "pass shared_experts=None."
+            )
+        num_tokens = hidden_states.shape[0]
+        if num_tokens > self.max_num_tokens:
+            raise ValueError(
+                f"MegaMoE got {num_tokens} tokens, but the symmetric buffer was "
+                f"sized for {self.max_num_tokens}."
+            )
+        self._synchronize_first_launch()
+
+        is_padding = None
+        if envs.VLLM_MOE_SKIP_PADDING and is_forward_context_available():
+            is_padding = get_forward_context().is_padding
+            if is_padding is not None:
+                is_padding = is_padding[:num_tokens]
+
+        deep_gemm = self._import_backend()
+        symm_buffer = self.get_symm_buffer()
+        shared_x_sf = None
+        shared_block_m = 0
+        if self.shared_spec is not None and self.shared_spec.scale_group_k:
+            shared_x_sf = symm_buffer.shared_l1_acts_sf
+            shared_block_m = self.get_block_m(num_tokens)
+        logical_topk_idx = None
+        if self.capture_fn is not None:
+            logical_topk_idx = torch.empty(
+                (num_tokens, num_topk), dtype=torch.int64, device=hidden_states.device
+            )
+        mapping, replicas, load, record, unpadded = _eplb_kernel_args(self.eplb_state)[:5]
+        bf16_mega_gate_front(
+            hidden_states,
+            gate_weight,
+            num_topk,
+            scoring_func=scoring_func,
+            routed_scaling_factor=routed_scaling_factor,
+            ep_rank=ep_rank,
+            bias=gate_bias,
+            x_fp8=symm_buffer.x[:num_tokens],
+            x_sf=symm_buffer.x_sf[:num_tokens],
+            topk_idx=symm_buffer.topk_idx[:num_tokens],
+            topk_weights=symm_buffer.topk_weights[:num_tokens],
+            shared_x_sf=shared_x_sf,
+            shared_block_m=shared_block_m or 0,
+            logical_topk_idx=logical_topk_idx,
+            is_padding=is_padding,
+            logical_to_physical=mapping,
+            replica_count=replicas,
+            expert_load=load,
+            record_enabled=record,
+            num_unpadded_tokens=unpadded,
+        )
+        # Capture logical ids; the front already mapped the staged ones to replicas.
+        if self.capture_fn is not None:
+            self.capture_fn(logical_topk_idx)
+
+        kwargs = dict(self._kernel_kwargs)
+        if self.has_fused_shared_experts:
+            kwargs["shared_l1_weights"] = self._kernel_weights("shared_l1")
+            kwargs["shared_l2_weights"] = self._kernel_weights("shared_l2")
+        y = torch.empty_like(hidden_states, dtype=torch.bfloat16)
+        getattr(deep_gemm, self.weight_format.kernel)(
             y,
             self.l1_weights,
             self.l2_weights,

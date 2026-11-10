@@ -201,6 +201,7 @@ _get_paged_sparse_mqa_logits_metadata_impl: Callable[..., Any] | None = None
 _tf32_hc_prenorm_gemm_impl: Callable[..., Any] | None = None
 _mega_mhc_impl: Callable[..., Any] | None = None
 _bf16_mega_gate_impl: Callable[..., Any] | None = None
+_bf16_mega_gate_front_impl: Callable[..., Any] | None = None
 _get_mn_major_tma_aligned_tensor_impl: Callable[..., Any] | None = None
 _get_mk_alignment_for_contiguous_layout_impl: Callable[..., Any] | None = None
 _get_theoretical_mk_alignment_for_contiguous_layout_impl: Callable[..., Any] | None = (
@@ -277,7 +278,7 @@ def _lazy_init() -> None:
     global _get_sparse_mqa_logits_metadata_impl
     global _get_paged_sparse_mqa_logits_metadata_impl
     global _tf32_hc_prenorm_gemm_impl, _mega_mhc_impl
-    global _bf16_mega_gate_impl
+    global _bf16_mega_gate_impl, _bf16_mega_gate_front_impl
     global _get_mn_major_tma_aligned_tensor_impl
     global _get_mk_alignment_for_contiguous_layout_impl
     global _get_theoretical_mk_alignment_for_contiguous_layout_impl
@@ -355,6 +356,7 @@ def _lazy_init() -> None:
     _tf32_hc_prenorm_gemm_impl = getattr(_dg, "tf32_hc_prenorm_gemm", None)
     _mega_mhc_impl = getattr(_dg, "mega_mhc", None)
     _bf16_mega_gate_impl = getattr(_dg, "bf16_mega_gate", None)
+    _bf16_mega_gate_front_impl = getattr(_dg, "bf16_mega_gate_front", None)
     _get_mn_major_tma_aligned_tensor_impl = getattr(
         _dg, "get_mn_major_tma_aligned_tensor", None
     )
@@ -569,6 +571,71 @@ def bf16_mega_gate(
         out=(topk_idx, topk_weights),
     )
     return topk_weights, topk_idx
+
+
+def has_bf16_mega_gate_front() -> bool:
+    """Whether the DeepGEMM build has the fused MoE front (bf16_mega_gate_front)."""
+    _lazy_init()
+    return _bf16_mega_gate_front_impl is not None
+
+
+def bf16_mega_gate_front(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    num_topk: int,
+    *,
+    scoring_func: str,
+    routed_scaling_factor: float,
+    ep_rank: int,
+    bias: torch.Tensor,
+    x_fp8: torch.Tensor,
+    x_sf: torch.Tensor,
+    topk_idx: torch.Tensor,
+    topk_weights: torch.Tensor,
+    shared_x_sf: torch.Tensor | None = None,
+    shared_block_m: int = 0,
+    logical_topk_idx: torch.Tensor | None = None,
+    is_padding: torch.Tensor | None = None,
+    logical_to_physical: torch.Tensor | None = None,
+    replica_count: torch.Tensor | None = None,
+    expert_load: torch.Tensor | None = None,
+    record_enabled: torch.Tensor | None = None,
+    num_unpadded_tokens: torch.Tensor | None = None,
+) -> None:
+    """Run the fused MoE front: ``bf16_mega_gate`` + ``prepare_megamoe_inputs``.
+
+    Same routing as :func:`bf16_mega_gate` (DeepGEMM's own config, split and
+    top-k), written straight into the MegaMoE symmetric buffer views together
+    with the MXFP8 hidden states, their UE8M0 scales, the shared-expert scale
+    page, the EPLB physical ids and the expert-load record.
+    """
+    _lazy_init()
+    if _bf16_mega_gate_front_impl is None:
+        raise RuntimeError(
+            "VLLM_MOSCA_FUSED_MOE_FRONT needs a DeepGEMM build with bf16_mega_gate_front."
+        )
+    _bf16_mega_gate_front_impl(
+        x,
+        weight,
+        num_topk,
+        routed_scaling_factor,
+        ep_rank,
+        bias,
+        x_fp8,
+        x_sf,
+        topk_idx,
+        topk_weights,
+        scoring_func=scoring_func,
+        shared_x_sf=shared_x_sf,
+        shared_block_m=shared_block_m,
+        logical_topk_idx=logical_topk_idx,
+        is_padding=is_padding,
+        logical_to_physical=logical_to_physical,
+        replica_count=replica_count,
+        expert_load=expert_load,
+        record_enabled=record_enabled,
+        num_unpadded_tokens=num_unpadded_tokens,
+    )
 
 
 def fp8_gemm_nt(*args, **kwargs):
@@ -1119,6 +1186,8 @@ def should_use_deepgemm_for_fp8_linear(
 __all__ = [
     "calc_diff",
     "bf16_mega_gate",
+    "bf16_mega_gate_front",
+    "has_bf16_mega_gate_front",
     "DeepGemmQuantScaleFMT",
     "fp8_gemm_nt",
     "fp8_einsum",

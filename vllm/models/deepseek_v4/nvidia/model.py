@@ -490,6 +490,30 @@ class DeepseekV4MoE(nn.Module):
                 raise RuntimeError(
                     "MegaMoE routing metadata must be prepared once by the model."
                 )
+            # Fused MoE front: gate + MXFP8 staging + EPLB map/record in one launch.
+            # Same routing and staged bytes as bf16_mega_gate + the experts' staging.
+            if (
+                envs.VLLM_MOSCA_FUSED_MOE_FRONT
+                and (
+                    envs.VLLM_MOSCA_FUSED_MOE_FRONT_MAX_T <= 0
+                    or hidden_states.shape[0] <= envs.VLLM_MOSCA_FUSED_MOE_FRONT_MAX_T
+                )
+                and self.gate.tid2eid is None
+                and bias_vl is None
+                and mega_gate_metadata.image_token_mask is None
+                and self.gate.e_score_correction_bias is not None
+                and self.experts.supports_fused_front()
+            ):
+                return self.experts.forward_fused_front(
+                    hidden_states,
+                    self.gate.weight,
+                    self.gate.e_score_correction_bias.data,
+                    self.n_activated_experts,
+                    scoring_func=self.scoring_func,
+                    routed_scaling_factor=self.routed_scaling_factor,
+                    ep_rank=self.ep_rank,
+                    shared_experts=self.shared_experts,
+                ).view(org_shape)
 
             unmapped_topk_idx = None
             fix_routing_mask = None
