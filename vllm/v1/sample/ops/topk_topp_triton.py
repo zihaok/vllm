@@ -1797,6 +1797,735 @@ def _get_buffer(
     return buffer[:num_programs]
 
 
+# ---------------------------------------------------------------------------
+# Standalone top-p (no active top-k) for batches beyond the split pipeline.
+#
+# _mosca_topp_kernel computes exactly the standalone top-p path of
+# _topk_topp_row: every tile reduction keeps its tile shape, dtype and
+# num_warps (so its reduction tree), and the per-tile partials are combined in
+# the same tile order, so the masked logits are bitwise identical. It is
+# restructured for speed:
+#   - bf16 logits are read directly (IN_BF16) and the fp32 row is written by
+#     the mask pass, so the bf16-to-fp32 copy in Sampler.apply_sampling_params
+#     goes away and every pass reads half the bytes. The bf16 tiles are loaded
+#     4 elements per thread (the fp32 tile's layout), which keeps the trees;
+#   - the next tile is loaded before the current tile is reduced (PREFETCH);
+#   - MERGED 2: a tile's max and min (pass 1) are one multi-operand
+#     reduction; every fp32 sum stays a lone tl.sum, whose tree (packed f32x2
+#     adds on sm_100+) a multi-operand reduction would not reproduce. MERGED 1
+#     (every tile reduction merged, sums included) is kept for targets where
+#     the trees agree, but changes the sums on sm_100+ and is not used there;
+#   - the outlier scatter is issued in the tile's own layout (SCATTER_ASM;
+#     2: the address is formed in the asm from the row base and the int32
+#     position) rather than converted to a one-element-per-thread layout;
+#   - with one program per SM, the pivot search defers the per-tile counts to
+#     the iterations that read them (SEARCH_MODE 1).
+# The launch configuration (programs per SM, register cap, search mode) is a
+# function of the batch size, _mosca_topp_config.
+# ---------------------------------------------------------------------------
+
+
+@triton.jit
+def _mosca_max_min_sum_combine(a0, b0, c0, a1, b1, c1):
+    return tl.maximum(a0, a1), tl.minimum(b0, b1), c0 + c1
+
+
+@triton.jit
+def _mosca_max_min_combine(a0, b0, a1, b1):
+    return tl.maximum(a0, a1), tl.minimum(b0, b1)
+
+
+@triton.jit
+def _mosca_sum_min_combine(a0, b0, a1, b1):
+    return a0 + a1, tl.minimum(b0, b1)
+
+
+@triton.jit
+def _mosca_sum_sum_combine(a0, b0, a1, b1):
+    return a0 + a1, b0 + b1
+
+
+@triton.jit
+def _mosca_merge_min(min_larger, num_min_larger, tile_min, tile_cnt):
+    # The tile-order merge of _update_min_larger_stats, given the tile's
+    # (min, count) already reduced.
+    is_new = tile_min < min_larger
+    is_same = tl.abs(tile_min - min_larger) < 1e-9
+    num_min_larger = tl.where(is_new, tile_cnt, num_min_larger + tile_cnt * is_same)
+    min_larger = tl.minimum(min_larger, tile_min)
+    return min_larger, num_min_larger
+
+
+@triton.jit
+def _mosca_pivot_tile(b, q, s, ml, nml, MERGED: tl.constexpr):
+    """One buffer tile against one pivot: the stock sum / min-larger update."""
+    above = b > q
+    if MERGED == 1:
+        ts, tmin = tl.reduce(
+            (b * above, tl.where(above, b, 1.0)), 0, _mosca_sum_min_combine
+        )
+        s += ts
+        tile_eq = above & (tl.abs(b - tmin) < 1e-9)
+        tcnt = tl.sum(tile_eq)
+        ml, nml = _mosca_merge_min(ml, nml, tmin, tcnt)
+    else:
+        s += tl.sum(b * above)
+        ml, nml = _update_min_larger_stats(b, above, ml, nml, 1.0)
+    return s, ml, nml
+
+
+@triton.jit
+def _mosca_bisect_step(q, s, ml, nml, p, lo, hi, num_iters, found,
+                       p_pivot, min_larger_prob, num_min_larger, p_pivots_sum):
+    """One iteration of the stock top-p pivot search, given its sweep results."""
+    if s >= p and s - (ml * nml) < p:
+        p_pivot = q
+        min_larger_prob = ml
+        num_min_larger = nml
+        p_pivots_sum = s
+        found = 1
+    if s > p:
+        lo = q
+    elif s < p:
+        hi = q
+    num_iters += 1
+    if (hi - lo) < 1e-9 or num_iters >= 18:
+        p_pivot = (hi + lo) / 2.0
+        min_larger_prob = ml
+        num_min_larger = nml
+        p_pivots_sum = s
+        found = 1
+    return lo, hi, num_iters, found, p_pivot, min_larger_prob, num_min_larger, p_pivots_sum
+
+
+@triton.jit
+def _mosca_search(SRC, n_valid, n_tiles, p, lo, hi,
+                  TILE: tl.constexpr, PREFETCH: tl.constexpr, MERGED: tl.constexpr):
+    """The stock pivot bisection (`while found_pivot == 0`) over SRC[0:n_valid]
+    in TILE-wide tiles (masked lanes read 0.0): per tile the stock sum above
+    the pivot and min-larger update, combined in tile order."""
+    p_pivot = 1.0
+    num_iters = 0
+    min_larger_prob = 1.0
+    num_min_larger = tl.zeros((), dtype=tl.uint32)
+    p_pivots_sum = 0.0
+    found = 0
+    sweeps = 0
+    offs = tl.arange(0, TILE)
+    while found == 0:
+        sweeps += 1
+        q = (hi - lo) * 0.5 + lo
+        s = 0.0
+        ml = 1.0
+        nml = tl.zeros((), dtype=tl.uint32)
+        if PREFETCH:
+            b_next = tl.load(SRC + offs, mask=offs < n_valid, other=0.0)
+        for i in range(0, n_tiles):
+            offs_n = i * TILE + offs
+            if PREFETCH:
+                b = b_next
+                offs_nn = offs_n + TILE
+                b_next = tl.load(SRC + offs_nn, mask=offs_nn < n_valid, other=0.0)
+            else:
+                b = tl.load(SRC + offs_n, mask=offs_n < n_valid, other=0.0)
+            s, ml, nml = _mosca_pivot_tile(b, q, s, ml, nml, MERGED)
+        (lo, hi, num_iters, found, p_pivot, min_larger_prob, num_min_larger,
+         p_pivots_sum) = _mosca_bisect_step(
+            q, s, ml, nml, p, lo, hi, num_iters, found,
+            p_pivot, min_larger_prob, num_min_larger, p_pivots_sum)
+    return p_pivot, min_larger_prob, num_min_larger, p_pivots_sum, num_iters, sweeps
+
+
+@triton.jit
+def _mosca_search_deferred(SRC, MINS, n_valid, n_tiles, p, lo, hi,
+                           TILE: tl.constexpr, PREFETCH: tl.constexpr, MERGED: tl.constexpr):
+    """The stock bisection over SRC[0:n_valid] (TILE-wide tiles, masked lanes
+    read 0.0), with its per-tile min/count work deferred: pass A reduces each
+    tile's sum above the pivot and min above the pivot (one multi-operand
+    reduction only when MERGED == 1) and parks the tile mins in MINS; the tile counts (elements within
+    1e-9 of their tile's min) and their tile-order merge, pass B, run only when
+    the iteration can read them: when the sum reaches p (the termination test)
+    or when the iteration is the last one (cap or collapsed range). The sums,
+    mins, counts and the merge order are the stock ones."""
+    p_pivot = 1.0
+    num_iters = 0
+    min_larger_prob = 1.0
+    num_min_larger = tl.zeros((), dtype=tl.uint32)
+    p_pivots_sum = 0.0
+    found = 0
+    sweeps = 0
+    offs = tl.arange(0, TILE)
+    while found == 0:
+        q = (hi - lo) * 0.5 + lo
+        tl.debug_barrier()  # MINS of the previous iteration fully read
+        s = 0.0
+        if PREFETCH >= 1:
+            b_next = tl.load(SRC + offs, mask=offs < n_valid, other=0.0)
+        for i in range(0, n_tiles):
+            offs_n = i * TILE + offs
+            if PREFETCH >= 1:
+                b = b_next
+                offs_nn = offs_n + TILE
+                b_next = tl.load(SRC + offs_nn, mask=offs_nn < n_valid, other=0.0)
+            else:
+                b = tl.load(SRC + offs_n, mask=offs_n < n_valid, other=0.0)
+            above = b > q
+            if MERGED == 1:
+                ts, tmin = tl.reduce(
+                    (b * above, tl.where(above, b, 1.0)), 0, _mosca_sum_min_combine
+                )
+            else:
+                ts = tl.sum(b * above)
+                tmin = tl.min(tl.where(above, b, 1.0))
+            s += ts
+            tl.store(MINS + i, tmin)
+        sweeps += 1
+        n_lo = lo
+        n_hi = hi
+        if s > p:
+            n_lo = q
+        elif s < p:
+            n_hi = q
+        last = ((n_hi - n_lo) < 1e-9) or (num_iters + 1 >= 18)
+        ml = 1.0
+        nml = tl.zeros((), dtype=tl.uint32)
+        if (s >= p) or last:
+            tl.debug_barrier()  # MINS written by pass A visible
+            if PREFETCH >= 1:
+                b_next = tl.load(SRC + offs, mask=offs < n_valid, other=0.0)
+            for i in range(0, n_tiles):
+                offs_n = i * TILE + offs
+                if PREFETCH >= 1:
+                    b = b_next
+                    offs_nn = offs_n + TILE
+                    b_next = tl.load(SRC + offs_nn, mask=offs_nn < n_valid, other=0.0)
+                else:
+                    b = tl.load(SRC + offs_n, mask=offs_n < n_valid, other=0.0)
+                above = b > q
+                tmin = tl.load(MINS + i)
+                tcnt = tl.sum(above & (tl.abs(b - tmin) < 1e-9))
+                ml, nml = _mosca_merge_min(ml, nml, tmin, tcnt)
+            sweeps += 1
+        (lo, hi, num_iters, found, p_pivot, min_larger_prob, num_min_larger,
+         p_pivots_sum) = _mosca_bisect_step(
+            q, s, ml, nml, p, lo, hi, num_iters, found,
+            p_pivot, min_larger_prob, num_min_larger, p_pivots_sum)
+    return p_pivot, min_larger_prob, num_min_larger, p_pivots_sum, num_iters, sweeps
+
+
+@triton.jit
+def _mosca_scatter(ptrs, vals, mask):
+    """Predicated st.global of every element in the tensor's own layout. A
+    plain tl.store of scattered pointers is first converted (through shared
+    memory) to a one-element-per-thread layout; this writes the same bytes to
+    the same addresses without that conversion."""
+    return tl.inline_asm_elementwise(
+        asm="{ .reg .pred %pm; setp.ne.s32 %pm, $3, 0; @%pm st.global.f32 [$1], $2; mov.b32 $0, 0; }",
+        constraints="=r,l,f,r",
+        args=[ptrs.to(tl.int64), vals, mask.to(tl.int32)],
+        dtype=tl.int32,
+        is_pure=False,
+        pack=1,
+    )
+
+
+@triton.jit
+def _mosca_scatter_pos(base, write_pos, vals):
+    """_mosca_scatter with the address formed inside the asm from the row's
+    base address and the int32 position (-1: no store), so no 64-bit pointer
+    per element is held in registers."""
+    return tl.inline_asm_elementwise(
+        asm="{ .reg .pred %pm; .reg .b64 %ad; setp.ge.s32 %pm, $1, 0; mad.wide.s32 %ad, $1, 4, $3; @%pm st.global.f32 [%ad], $2; mov.b32 $0, 0; }",
+        constraints="=r,r,f,l",
+        args=[write_pos, vals, base],
+        dtype=tl.int32,
+        is_pure=False,
+        pack=1,
+    )
+
+
+@triton.jit
+def _mosca_arange(BLOCK: tl.constexpr, IN_BF16: tl.constexpr):
+    """tl.arange(0, BLOCK); for bf16 input its contiguity is cut to 4 so the
+    loaded tile gets the fp32 tile's layout (4 elements per thread per
+    repetition), which fixes every reduction tree to the stock one."""
+    ar = tl.arange(0, BLOCK)
+    if IN_BF16:
+        ar = (ar // 4) * 4 + ar % 4
+    return ar
+
+
+@triton.jit
+def _mosca_load(ROW, offs, mask, IN_BF16: tl.constexpr):
+    if IN_BF16:
+        x = tl.load(ROW + offs, mask=mask, other=-float("inf")).to(tl.float32)
+    else:
+        x = tl.load(ROW + offs, mask=mask, other=-float("inf"))
+    return x
+
+
+@triton.jit
+def _mosca_topp_row(
+    LOGITS_ROW,
+    OUT_ROW,
+    BUFFER_ROW,
+    NORMAL_CDF_TO_SIGMA_TABLE,
+    P,
+    row_id,
+    VOCAB_SIZE: tl.constexpr,
+    MASK_VALUE: tl.constexpr,
+    BLOCK_SIZE: tl.constexpr,
+    BLOCK_SIZE_TRUNC: tl.constexpr,
+    PREFETCH: tl.constexpr,
+    MERGED: tl.constexpr,
+    IN_BF16: tl.constexpr,
+    SCATTER_ASM: tl.constexpr,
+    MINS_ROW,
+    SEARCH_MODE: tl.constexpr,
+):
+    """Standalone top-p mask of one row (no active top-k). fp32 input: masked
+    in place (OUT_ROW == LOGITS_ROW). bf16 input (IN_BF16): the fp32 row is
+    written to OUT_ROW whole, masked or not, as the stock bf16-to-fp32 copy
+    followed by the in-place mask would leave it."""
+    NUM_TILES: tl.constexpr = (VOCAB_SIZE + BLOCK_SIZE - 1) // BLOCK_SIZE
+    final_pivot = -float("inf")
+    duplicate_logit = float("inf")
+    num_duplicate_logit = tl.zeros((), dtype=tl.uint32)
+    num_keep = tl.zeros((), dtype=tl.uint32)
+    num_kept = tl.zeros((), dtype=tl.uint32)
+
+    max_logit = -float("inf")
+    min_logit = float("inf")
+
+    p = tl.load(P + row_id)
+    if p < 1.0:
+        # Zeroth pass: avg and std from the first block (stock code).
+        offs = _mosca_arange(BLOCK_SIZE, IN_BF16)
+        mask_n = offs < VOCAB_SIZE
+        logits_blk0 = _mosca_load(LOGITS_ROW, offs, mask_n, IN_BF16)
+        finite_mask = (logits_blk0 > -float("inf")) & mask_n
+        num_finite = tl.sum(finite_mask)
+        finite_logits = tl.where(finite_mask, logits_blk0, 0.0)
+        avg_logit = tl.where(num_finite > 0, tl.sum(finite_logits) / num_finite, 0.0)
+        sq_avg_logit = tl.where(
+            num_finite > 0,
+            tl.sum(finite_logits * finite_logits) / num_finite,
+            0.0,
+        )
+        std_logit = tl.sqrt(tl.maximum(sq_avg_logit - avg_logit * avg_logit, 0.0))
+        max_sample = avg_logit + std_logit * 10.0
+        sum_exp_logits = 0.0
+
+        # First pass: max, min and sum of exp(x - max_sample).
+        if PREFETCH >= 1:
+            x_next = logits_blk0
+        if PREFETCH >= 2:
+            x_next2 = _mosca_load(LOGITS_ROW, BLOCK_SIZE + offs, BLOCK_SIZE + offs < VOCAB_SIZE, IN_BF16)
+        for i in range(0, NUM_TILES):
+            offs_n = i * BLOCK_SIZE + offs
+            mask_n = offs_n < VOCAB_SIZE
+            if PREFETCH >= 2:
+                logits_blk = x_next
+                x_next = x_next2
+                offs_nn = offs_n + 2 * BLOCK_SIZE
+                x_next2 = _mosca_load(LOGITS_ROW, offs_nn, offs_nn < VOCAB_SIZE, IN_BF16)
+            elif PREFETCH == 1:
+                logits_blk = x_next
+                offs_nn = offs_n + BLOCK_SIZE
+                x_next = _mosca_load(LOGITS_ROW, offs_nn, offs_nn < VOCAB_SIZE, IN_BF16)
+            else:
+                logits_blk = _mosca_load(LOGITS_ROW, offs_n, mask_n, IN_BF16)
+            finite_blk = tl.where(logits_blk > -float("inf"), logits_blk, float("inf"))
+            probs_blk = tl.exp(logits_blk - max_sample)
+            probs_blk = tl.where(mask_n, probs_blk, 0.0)
+            if MERGED == 1:
+                t_max, t_min, t_sum = tl.reduce(
+                    (logits_blk, finite_blk, probs_blk), 0, _mosca_max_min_sum_combine
+                )
+                max_logit = tl.maximum(max_logit, t_max)
+                min_logit = tl.minimum(min_logit, t_min)
+                sum_exp_logits += t_sum
+            elif MERGED == 2:
+                t_max, t_min = tl.reduce((logits_blk, finite_blk), 0, _mosca_max_min_combine)
+                max_logit = tl.maximum(max_logit, t_max)
+                min_logit = tl.minimum(min_logit, t_min)
+                sum_exp_logits += tl.sum(probs_blk)
+            else:
+                max_logit = tl.maximum(max_logit, tl.max(logits_blk))
+                min_logit = tl.minimum(min_logit, tl.min(finite_blk))
+                sum_exp_logits += tl.sum(probs_blk)
+
+        min_logit = tl.minimum(min_logit, max_logit)
+
+        idx = tl.cast(p * 200, tl.int32)
+        idx = tl.maximum(0, tl.minimum(idx, 199))
+        sigma = tl.load(NORMAL_CDF_TO_SIGMA_TABLE + idx)
+        sigma = sigma + tl.abs(sigma) * -0.25
+        outlier_pivot = avg_logit + std_logit * sigma
+
+        outlier_prob = tl.exp(outlier_pivot - max_sample) / sum_exp_logits
+        sum_outlier_probs = 0.0
+        num_outliers = tl.zeros((), dtype=tl.uint32)
+
+        # Second pass: softmax and outlier gather (stock code).
+        if PREFETCH >= 1:
+            x_next = _mosca_load(LOGITS_ROW, offs, offs < VOCAB_SIZE, IN_BF16)
+        if PREFETCH >= 2:
+            x_next2 = _mosca_load(LOGITS_ROW, BLOCK_SIZE + offs, BLOCK_SIZE + offs < VOCAB_SIZE, IN_BF16)
+        for i in range(0, NUM_TILES):
+            offs_n = i * BLOCK_SIZE + offs
+            mask_n = offs_n < VOCAB_SIZE
+            if PREFETCH >= 2:
+                probs_blk = x_next
+                x_next = x_next2
+                offs_nn = offs_n + 2 * BLOCK_SIZE
+                x_next2 = _mosca_load(LOGITS_ROW, offs_nn, offs_nn < VOCAB_SIZE, IN_BF16)
+            elif PREFETCH == 1:
+                probs_blk = x_next
+                offs_nn = offs_n + BLOCK_SIZE
+                x_next = _mosca_load(LOGITS_ROW, offs_nn, offs_nn < VOCAB_SIZE, IN_BF16)
+            else:
+                probs_blk = _mosca_load(LOGITS_ROW, offs_n, mask_n, IN_BF16)
+            probs_blk = tl.exp(probs_blk - max_sample)
+            probs_blk = probs_blk / sum_exp_logits
+
+            outlier_mask = (probs_blk > outlier_prob) & mask_n
+            if MERGED == 1:
+                t_so, t_no = tl.reduce(
+                    (outlier_mask * probs_blk, outlier_mask.to(tl.int32)), 0,
+                    _mosca_sum_sum_combine,
+                )
+                sum_outlier_probs += t_so
+                cumulative_pos = tl.cast(
+                    tl.cumsum(outlier_mask) - 1 + num_outliers, tl.int32
+                )
+                num_outliers += t_no
+            else:
+                sum_outlier_probs += tl.sum(outlier_mask * probs_blk)
+                cumulative_pos = tl.cast(
+                    tl.cumsum(outlier_mask) - 1 + num_outliers, tl.int32
+                )
+                num_outliers += tl.sum(outlier_mask)
+            write_pos = tl.where(outlier_mask, cumulative_pos, -1)
+            if SCATTER_ASM == 2:
+                _mosca_scatter_pos(
+                    tl.zeros(write_pos.shape, tl.int64) + BUFFER_ROW.to(tl.int64), write_pos, probs_blk
+                )
+            elif SCATTER_ASM:
+                _mosca_scatter(BUFFER_ROW + write_pos, probs_blk, outlier_mask)
+            else:
+                tl.store(BUFFER_ROW + write_pos, probs_blk, mask=outlier_mask)
+        # Other threads read the scattered outliers next (_BUFFER_BARRIER_NOTE).
+        tl.debug_barrier()
+
+        max_range = tl.exp(max_logit - max_sample) / sum_exp_logits
+        min_range = tl.exp(min_logit - max_sample) / sum_exp_logits
+
+        if sum_outlier_probs > p:
+            min_range = outlier_prob
+            search_range = tl.cast(num_outliers, tl.int32)
+            search_iters = tl.cast(
+                (num_outliers + BLOCK_SIZE_TRUNC - 1) // BLOCK_SIZE_TRUNC,
+                tl.int32,
+            )
+            if SEARCH_MODE == 1:
+                p_pivot, min_larger_prob, num_min_larger, p_pivots_sum, _, _ = _mosca_search_deferred(
+                    BUFFER_ROW, MINS_ROW, search_range, search_iters, p, min_range, max_range,
+                    BLOCK_SIZE_TRUNC, PREFETCH, MERGED,
+                )
+            else:
+                p_pivot, min_larger_prob, num_min_larger, p_pivots_sum, _, _ = _mosca_search(
+                    BUFFER_ROW, search_range, search_iters, p, min_range, max_range,
+                    BLOCK_SIZE_TRUNC, PREFETCH, MERGED,
+                )
+        else:
+            # Re-populate the buffer with full softmax probabilities.
+            for i in range(0, NUM_TILES):
+                offs_n = i * BLOCK_SIZE + offs
+                mask_n = offs_n < VOCAB_SIZE
+                probs_blk = _mosca_load(LOGITS_ROW, offs_n, mask_n, IN_BF16)
+                probs_blk = tl.exp(probs_blk - max_sample)
+                probs_blk = probs_blk / sum_exp_logits
+                tl.store(BUFFER_ROW + offs_n, probs_blk, mask=mask_n)
+            tl.debug_barrier()
+            if SEARCH_MODE == 1:
+                p_pivot, min_larger_prob, num_min_larger, p_pivots_sum, _, _ = _mosca_search_deferred(
+                    BUFFER_ROW, MINS_ROW, VOCAB_SIZE, NUM_TILES, p, min_range, max_range,
+                    BLOCK_SIZE, PREFETCH, MERGED,
+                )
+            else:
+                p_pivot, min_larger_prob, num_min_larger, p_pivots_sum, _, _ = _mosca_search(
+                    BUFFER_ROW, VOCAB_SIZE, NUM_TILES, p, min_range, max_range,
+                    BLOCK_SIZE, PREFETCH, MERGED,
+                )
+
+        duplicate_logit = tl.log(min_larger_prob * sum_exp_logits) + max_sample
+        num_duplicate_logit = num_min_larger
+        num_keep = num_duplicate_logit - tl.cast(
+            (p_pivots_sum - p) / min_larger_prob, tl.uint32
+        )
+        num_kept = tl.zeros((), dtype=tl.uint32)
+
+        final_pivot = tl.log(p_pivot * sum_exp_logits) + max_sample
+
+    # Sixth pass: apply the mask and store (stock code). With bf16 input the
+    # pass always runs, so rows the stock code leaves unmasked still get their
+    # fp32 copy.
+    if not (final_pivot < max_logit):
+        final_pivot = -float("inf")
+    no_mask = final_pivot == -float("inf")
+    if IN_BF16 or (final_pivot != -float("inf")):
+        offs0 = _mosca_arange(BLOCK_SIZE, IN_BF16)
+        if PREFETCH >= 1:
+            x_next = _mosca_load(LOGITS_ROW, offs0, offs0 < VOCAB_SIZE, IN_BF16)
+        if PREFETCH >= 2:
+            x_next2 = _mosca_load(LOGITS_ROW, BLOCK_SIZE + offs0, BLOCK_SIZE + offs0 < VOCAB_SIZE, IN_BF16)
+        for i in range(0, NUM_TILES):
+            offs_n = i * BLOCK_SIZE + offs0
+            mask_n = offs_n < VOCAB_SIZE
+            if PREFETCH >= 2:
+                logits_blk = x_next
+                x_next = x_next2
+                offs_nn = offs_n + 2 * BLOCK_SIZE
+                x_next2 = _mosca_load(LOGITS_ROW, offs_nn, offs_nn < VOCAB_SIZE, IN_BF16)
+            elif PREFETCH == 1:
+                logits_blk = x_next
+                offs_nn = offs_n + BLOCK_SIZE
+                x_next = _mosca_load(LOGITS_ROW, offs_nn, offs_nn < VOCAB_SIZE, IN_BF16)
+            else:
+                logits_blk = _mosca_load(LOGITS_ROW, offs_n, mask_n, IN_BF16)
+            if IN_BF16:
+                keep_mask = ((logits_blk > final_pivot) | no_mask) & mask_n
+            else:
+                keep_mask = (logits_blk > final_pivot) & mask_n
+
+            if num_keep < num_duplicate_logit:
+                if not no_mask:
+                    duplicate_mask = (tl.abs(logits_blk - duplicate_logit) < 1e-9) & mask_n
+                    duplicate_count = tl.cumsum(duplicate_mask) + num_kept
+                    duplicate_keep_mask = (duplicate_count <= num_keep) & duplicate_mask
+                    duplicate_remove_mask = duplicate_mask & ~duplicate_keep_mask
+                    num_kept += tl.sum(duplicate_keep_mask)
+                    keep_mask = keep_mask & (~duplicate_remove_mask)
+
+            logits_blk = tl.where(keep_mask, logits_blk, MASK_VALUE)
+            tl.store(OUT_ROW + offs_n, logits_blk, mask=mask_n)
+
+
+@triton.jit(do_not_specialize_on_alignment=["BATCH_SIZE"])
+def _mosca_topp_kernel(
+    LOGITS,
+    LOGITS_STRIDE_0,
+    OUT,
+    OUT_STRIDE_0,
+    BUFFER,
+    ROW_COUNTER,
+    MINS,
+    NORMAL_CDF_TO_SIGMA_TABLE,
+    P,
+    BATCH_SIZE,
+    VOCAB_SIZE: tl.constexpr,
+    MASK_VALUE: tl.constexpr,
+    BLOCK_SIZE: tl.constexpr,
+    BLOCK_SIZE_TRUNC: tl.constexpr,
+    PREFETCH: tl.constexpr,
+    MERGED: tl.constexpr,
+    IN_BF16: tl.constexpr,
+    SCATTER_ASM: tl.constexpr,
+    SEARCH_MODE: tl.constexpr,
+    STATIC_GRID: tl.constexpr,
+):
+    """Persistent programs, rows handed out by an atomic counter that is zero
+    on entry (as _topk_topp_dynamic_kernel), or with STATIC_GRID row
+    pid, pid + grid, ... (as _topk_topp_kernel). fp32 LOGITS are masked in
+    place (OUT is LOGITS); bf16 LOGITS (IN_BF16) are written to OUT as fp32."""
+    pid = tl.program_id(0)
+    BUFFER_ROW = BUFFER + pid.to(tl.int64) * VOCAB_SIZE
+    MINS_ROW = MINS + pid.to(tl.int64) * 32
+    if STATIC_GRID:
+        row_id = pid
+    else:
+        row_id = tl.atomic_add(ROW_COUNTER, 1)
+    while row_id < BATCH_SIZE:
+        _mosca_topp_row(
+            LOGITS + row_id.to(tl.int64) * LOGITS_STRIDE_0,
+            OUT + row_id.to(tl.int64) * OUT_STRIDE_0,
+            BUFFER_ROW,
+            NORMAL_CDF_TO_SIGMA_TABLE,
+            P,
+            row_id,
+            VOCAB_SIZE=VOCAB_SIZE,
+            MASK_VALUE=MASK_VALUE,
+            BLOCK_SIZE=BLOCK_SIZE,
+            BLOCK_SIZE_TRUNC=BLOCK_SIZE_TRUNC,
+            PREFETCH=PREFETCH,
+            MERGED=MERGED,
+            IN_BF16=IN_BF16,
+            SCATTER_ASM=SCATTER_ASM,
+            MINS_ROW=MINS_ROW,
+            SEARCH_MODE=SEARCH_MODE,
+        )
+        if STATIC_GRID:
+            row_id += tl.num_programs(0)
+        else:
+            row_id = tl.atomic_add(ROW_COUNTER, 1)
+
+
+# Launch rule, by rows per SM (measured on VR200): each entry is
+# (rows-per-SM upper bound (exclusive), programs
+# per SM, maxnreg (0 = no cap), PREFETCH, MERGED, SCATTER_ASM, SEARCH_MODE,
+# STATIC_GRID).
+_MOSCA_TOPP_RULE: tuple[tuple[float, int, int, int, int, int, int, int], ...] = (
+    (1.0, 1, 0, 1, 2, 2, 1, 1),
+    (float("inf"), 2, 128, 1, 2, 1, 1, 0),
+)
+
+
+def _mosca_topp_config(batch_size: int, num_sm: int) -> tuple[int, int, int, int, int, int, int]:
+    """(programs per SM, maxnreg, PREFETCH, MERGED, SCATTER_ASM, SEARCH_MODE,
+    STATIC_GRID)."""
+    for rows_per_sm, *cfg in _MOSCA_TOPP_RULE:
+        if batch_size < rows_per_sm * num_sm:
+            return tuple(cfg)
+    return tuple(_MOSCA_TOPP_RULE[-1][1:])
+
+
+def _mosca_topp_warmup_inputs(vllm_config: Any) -> dict[str, Any]:
+    vocab_size = vllm_config.model_config.get_vocab_size()
+    batch_size: Any = WarmupIntRange(
+        _SPLIT_MAX_BATCH + 1, _max_sampler_batch_size(vllm_config) + 1
+    )
+    in_dtype: Any = WarmupChoices(torch.bfloat16, torch.float32)
+    logits_stride: Any = WarmupChoices(16, 2)
+    return dict(
+        logits=TritonWarmupTensor(
+            in_dtype, shape=(batch_size, vocab_size), strides=(logits_stride, 1)
+        ),
+        out=TritonWarmupTensor(
+            torch.float32, shape=(batch_size, vocab_size), strides=(logits_stride, 1)
+        ),
+        buffer=TritonWarmupTensor(torch.float32),
+        row_counter=TritonWarmupTensor(torch.int32),
+        mins=TritonWarmupTensor(torch.float32),
+        normal_cdf_to_sigma_table=TritonWarmupTensor(torch.float32),
+        p=TritonWarmupTensor(torch.float32),
+        mask_value=float("-inf"),
+        num_sm=num_compute_units(),
+    )
+
+
+@triton_kernel_dispatcher_with_warmup(
+    kernel=_mosca_topp_kernel,
+    warmup_inputs=_mosca_topp_warmup_inputs,
+)
+def _mosca_topp_launch(
+    logits: torch.Tensor,
+    out: torch.Tensor,
+    buffer: torch.Tensor,
+    row_counter: torch.Tensor,
+    mins: torch.Tensor,
+    normal_cdf_to_sigma_table: torch.Tensor,
+    p: torch.Tensor,
+    mask_value: float,
+    num_sm: int,
+) -> DispatchSpec:
+    batch_size, vocab_size = logits.shape
+    programs_per_sm, maxnreg, prefetch, merged, scatter_asm, search_mode, static_grid = (
+        _mosca_topp_config(batch_size, num_sm)
+    )
+    launch = dict(
+        P=p,
+        BATCH_SIZE=batch_size,
+        VOCAB_SIZE=vocab_size,
+        MASK_VALUE=mask_value,
+        # Same tiles and warps as _topk_topp_kernel: they fix the reduction
+        # trees, so they must match for identical results.
+        BLOCK_SIZE=8192,
+        BLOCK_SIZE_TRUNC=4096,
+        PREFETCH=prefetch,
+        MERGED=merged,
+        IN_BF16=logits.dtype == torch.bfloat16,
+        SCATTER_ASM=scatter_asm,
+        SEARCH_MODE=search_mode,
+        STATIC_GRID=static_grid,
+        num_warps=8,
+    )
+    if maxnreg:
+        launch["maxnreg"] = maxnreg
+    return (min(programs_per_sm * num_sm, batch_size),), launch
+
+
+_MOSCA_SCRATCH: dict[torch.device, dict[str, torch.Tensor]] = {}
+
+
+def _mosca_topp(
+    logits: torch.Tensor,
+    p: torch.Tensor,
+    mask_value: float,
+    num_sm: int,
+    out: torch.Tensor | None = None,
+) -> None:
+    """Standalone top-p over every row: fp32 `logits` masked in place, or bf16
+    `logits` written masked to the fp32 `out`."""
+    batch_size, vocab_size = logits.shape
+    programs_per_sm = _mosca_topp_config(batch_size, num_sm)[0]
+    num_programs = min(programs_per_sm * num_sm, batch_size)
+    ws = _MOSCA_SCRATCH.get(logits.device)
+    if (
+        ws is None
+        or ws["buffer"].shape[0] < num_programs
+        or ws["buffer"].shape[1] != vocab_size
+    ):
+        size = max(num_programs, 2 * num_sm)
+        ws = {
+            "buffer": torch.empty(
+                (size, vocab_size), dtype=torch.float32, device=logits.device
+            ),
+            "mins": torch.empty((size, 32), dtype=torch.float32, device=logits.device),
+            "row_counter": torch.zeros(1, dtype=torch.int32, device=logits.device),
+        }
+        _MOSCA_SCRATCH[logits.device] = ws
+    ws["row_counter"].zero_()
+    normal_cdf_to_sigma_table, _ = _get_tables(logits)
+    _mosca_topp_launch(
+        logits,
+        logits if out is None else out,
+        ws["buffer"][:num_programs],
+        ws["row_counter"],
+        ws["mins"][:num_programs],
+        normal_cdf_to_sigma_table,
+        p,
+        mask_value,
+        num_sm,
+    )
+
+
+def apply_top_p_from_bf16(logits: torch.Tensor, p: torch.Tensor) -> torch.Tensor | None:
+    """The bf16-to-fp32 copy of Sampler.apply_sampling_params and the
+    standalone top-p mask of apply_top_k_top_p_triton (k=None) in one kernel.
+
+    Returns the fp32 masked logits, or None when this path does not apply (the
+    caller then copies and masks as before)."""
+    if (
+        logits.ndim != 2
+        or logits.dtype != torch.bfloat16
+        or logits.device.type != "cuda"
+        or not current_platform.is_cuda()
+        or logits.stride(1) != 1
+        or logits.shape[0] <= _SPLIT_MAX_BATCH
+    ):
+        return None
+    out = torch.empty(logits.shape, dtype=torch.float32, device=logits.device)
+    _mosca_topp(
+        logits,
+        p.to(torch.float32),
+        float("-inf"),
+        num_compute_units(logits.device.index),
+        out=out,
+    )
+    return out
+
+
 def apply_top_k_top_p_triton(
     logits: torch.Tensor,
     k: torch.Tensor | None,
@@ -1852,6 +2581,18 @@ def apply_top_k_top_p_triton(
         p_ptr = logits  # Dummy pointer (won't be read)
 
     num_sm = num_compute_units(logits.device.index)
+
+    # Standalone top-p rows (no top-k) beyond the split pipeline's range:
+    # _mosca_topp_kernel (same results, see its section).
+    if (
+        topp_enabled
+        and not topk_enabled
+        and logits.device.type == "cuda"
+        and current_platform.is_cuda()
+        and batch_size > _SPLIT_MAX_BATCH
+    ):
+        _mosca_topp(logits, p_ptr, mask_value, num_sm)
+        return logits
 
     # At small batch sizes the monolithic kernel's standalone top-p path is
     # latency-bound (one program per row, serial vocab sweeps), so use the
