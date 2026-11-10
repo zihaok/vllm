@@ -1,5 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import os
+
 import torch
 
 from vllm.platforms import current_platform
@@ -1582,6 +1584,22 @@ def _resample_finalize_kernel(
 
 _RESAMPLE_SCREEN_BLOCK_SIZE = 1024
 
+# Stock launches at low row counts (default off): with VLLM_MOSCA_SAMP_LOWT_STOCK=1, a
+# verify chunk of at most the library's own split-pipeline row threshold
+# (topk_topp_triton._SPLIT_MAX_BATCH, 64 rows) takes the stock launch
+# path below: no register cap on the stats kernel and _resample_kernel +
+# _insert_resampled_kernel instead of the screened resample. Both paths give
+# the same tokens (the screened kernels are bitwise to the stock ones); the
+# stock launches are faster at these row counts. Above the threshold nothing
+# changes. Off: every line below behaves as before.
+_MOSCA_LOWT_STOCK = os.environ.get("VLLM_MOSCA_SAMP_LOWT_STOCK", "0") == "1"
+try:
+    from vllm.v1.sample.ops.topk_topp_triton import (
+        _SPLIT_MAX_BATCH as _MOSCA_LOWT_STOCK_MAX_ROWS,
+    )
+except ImportError:  # pragma: no cover
+    _MOSCA_LOWT_STOCK_MAX_ROWS = 0
+
 
 def rejection_sample(
     # [num_logits, V]
@@ -1627,6 +1645,7 @@ def rejection_sample(
     )
     num_reqs = cu_num_logits.shape[0] - 1
     num_logits, vocab_size = target_logits.shape
+    stock_launch = _MOSCA_LOWT_STOCK and num_logits <= _MOSCA_LOWT_STOCK_MAX_ROWS
 
     watermark = contexts is not None
     assert watermark == (watermarking is not None) == (watermark_key is not None), (
@@ -1725,7 +1744,7 @@ def rejection_sample(
         # The kernel is memory-latency bound and register-limited to 5 CTAs
         # per SM; 80 registers fit 6 (~9% faster on Rubin). Only register
         # allocation changes, not the arithmetic.
-        **({"maxnreg": 80} if current_platform.is_cuda() else {}),
+        **({"maxnreg": 80} if current_platform.is_cuda() and not stock_launch else {}),
     )
 
     # Precompute the running joint ratio and residual mass for block
@@ -1859,7 +1878,12 @@ def rejection_sample(
     )
 
     # Resample the rejected/bonus tokens.
-    if not watermark and not use_fp64 and current_platform.is_cuda():
+    if (
+        not watermark
+        and not use_fp64
+        and current_platform.is_cuda()
+        and not stock_launch
+    ):
         _resample_screened(
             sampled,
             num_sampled,

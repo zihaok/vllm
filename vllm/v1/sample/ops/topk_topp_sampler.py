@@ -20,6 +20,7 @@ if HAS_TRITON:
         _topk_topp,
         _mosca_topp_launch,
         _topk_topp_dynamic,
+        mosca_sbw_warmup,
         _topp_split_mask,
         _topp_split_stats,
         _topp_split_step,
@@ -36,6 +37,17 @@ def register_top_k_top_p_warmups() -> None:
         if current_platform.is_cuda():
             _topk_topp_dynamic.register_warmup()
             _mosca_topp_launch.register_warmup()
+            # Split-row top-p (VLLM_MOSCA_SAMP_SBW, default off): compiled
+            # here, eagerly, and its scratch sized for the window's largest batch
+            # before the KV cache is sized.
+            from vllm.model_executor.warmup.jit_warmup import JitWarmupRegistry
+
+            reg = JitWarmupRegistry._active.get()
+            if reg is not None and torch.cuda.is_available():
+                mosca_sbw_warmup(
+                    torch.device("cuda", torch.cuda.current_device()),
+                    reg.vllm_config.model_config.get_vocab_size(),
+                )
         if current_platform.is_cuda_alike():
             _topp_split_stats.register_warmup()
             _topp_split_step.register_warmup()
