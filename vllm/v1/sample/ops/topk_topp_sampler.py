@@ -18,6 +18,7 @@ from vllm.utils.flashinfer import has_flashinfer
 if HAS_TRITON:
     from vllm.v1.sample.ops.topk_topp_triton import (
         _topk_topp,
+        _mosca_topp_launch,
         _topk_topp_dynamic,
         _topp_split_mask,
         _topp_split_stats,
@@ -34,6 +35,7 @@ def register_top_k_top_p_warmups() -> None:
         _topk_topp.register_warmup()
         if current_platform.is_cuda():
             _topk_topp_dynamic.register_warmup()
+            _mosca_topp_launch.register_warmup()
         if current_platform.is_cuda_alike():
             _topp_split_stats.register_warmup()
             _topp_split_step.register_warmup()

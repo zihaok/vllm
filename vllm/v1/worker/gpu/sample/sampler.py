@@ -38,6 +38,15 @@ from vllm.v1.worker.gpu.sample.thinking_budget import ThinkingBudgetState
 from vllm.v1.worker.gpu.sample.trace_replay import TraceReplayState
 from vllm.v1.worker.gpu.states import RequestState
 
+try:  # bf16-to-fp32 copy folded into the top-p kernel
+    from vllm.v1.sample.ops.topk_topp_triton import apply_top_p_from_bf16
+    try:
+        from vllm.v1.sample.ops.topk_topp_triton import _SPLIT_MAX_BATCH as _MOSCA_FOLD_MIN_EXCL
+    except ImportError:
+        _MOSCA_FOLD_MIN_EXCL = 0
+except ImportError:  # pragma: no cover
+    apply_top_p_from_bf16 = None
+
 
 class Sampler:
     def __init__(
@@ -83,6 +92,11 @@ class Sampler:
             TraceReplayState(req_states) if enable_trace_replay else None
         )
         self.needs_logits_processing = np.zeros(max_num_reqs, dtype=bool)
+        # Requests that need anything besides top-p on the fp32 logits:
+        # temperature other than 0/1, min_p, top_k, thinking budget or any
+        # logits processor. Only batches with none of them take the folded
+        # bf16 top-p path.
+        self.needs_other_processing = np.zeros(max_num_reqs, dtype=bool)
         self.num_speculative_tokens = num_speculative_tokens
         self.return_sampling_mask = return_sampling_mask
         self.use_flashinfer = (
@@ -95,12 +109,21 @@ class Sampler:
 
     def add_request(self, req_idx: int, sampling_params: SamplingParams) -> None:
         needs_processing = self.sampling_states.add_request(req_idx, sampling_params)
-        needs_processing |= self.thinking_budget_state.add_request(
-            req_idx, sampling_params
+        other = bool(
+            self.thinking_budget_state.add_request(req_idx, sampling_params)
         )
         for processor in self.logits_processors:
-            needs_processing |= processor.add_request(req_idx, sampling_params)
+            other |= bool(processor.add_request(req_idx, sampling_params))
+        needs_processing |= other
         self.needs_logits_processing[req_idx] = needs_processing
+        temperature = sampling_params.temperature
+        self.needs_other_processing[req_idx] = (
+            other
+            or (temperature != 0.0 and temperature != 1.0)
+            or sampling_params.min_p != 0.0
+            or int(self.sampling_states.top_k.np[req_idx])
+            != self.sampling_states.vocab_size
+        )
 
         self.logprob_token_ids_state.add_request(req_idx, sampling_params)
         if self.trace_replay_state is not None:
@@ -231,6 +254,23 @@ class Sampler:
     ) -> torch.Tensor:
         if not np.any(self.needs_logits_processing[idx_mapping_np]):
             return logits
+
+        if (
+            apply_top_p_from_bf16 is not None
+            and not skip_top_k_top_p
+            and logits.dtype == torch.bfloat16
+            and logits.shape[0] > _MOSCA_FOLD_MIN_EXCL
+            and not np.any(self.needs_other_processing[idx_mapping_np])
+        ):
+            # Only top-p acts on these rows: the copy and the mask run as one
+            # kernel that reads the bf16 logits once per pass.
+            top_k, top_p, _ = self.sampling_states.get_top_k_top_p(
+                expanded_idx_mapping, idx_mapping_np, logits.shape[-1]
+            )
+            if top_k is None and top_p is not None:
+                out = apply_top_p_from_bf16(logits, top_p)
+                if out is not None:
+                    return out
 
         # Copy logits to a new FP32 tensor.
         logits = torch.empty_like(logits, dtype=torch.float32).copy_(logits)
