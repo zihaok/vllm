@@ -857,3 +857,309 @@ def _gumbel_sample_screened(
         num_warps=1,
     )
     return sampled
+
+
+# ---------------------------------------------------------------- Fused Markov step (kernels copied from the screened ones above)
+@triton.jit
+def _gumbel_screen_kernel_m1(
+    # [num_tokens, num_blocks]
+    local_value_ptr,
+    # [num_tokens, num_blocks]: token id of the block max
+    local_token_ptr,
+    # [num_tokens, num_blocks]: 1 if local_value still needs the exact value
+    # of local_token (one candidate), 0 if local_value is already exact.
+    local_pending_ptr,
+    local_stride,
+    # [max_num_reqs, num_cols, vocab_size]
+    logits_cache_ptr,
+    logits_cache_stride_0,
+    logits_cache_stride_1,
+    logits_cache_col_ptr,
+    logits_cache_row_mapping_ptr,
+    logits_ptr,
+    logits_stride,
+    bias_ptr,
+    bias_stride,
+    expanded_idx_mapping_ptr,
+    seeds_ptr,
+    pos_ptr,
+    temp_ptr,
+    vocab_size,
+    idx_stride,
+    pos_stride,
+    BLOCK_SIZE: tl.constexpr,
+    IS_DRAFTING: tl.constexpr,
+    APPLY_TEMPERATURE: tl.constexpr,
+    PER_TOKEN_COL: tl.constexpr,
+    HAS_BIAS: tl.constexpr,
+    MAX_CANDIDATES: tl.constexpr,
+):
+    """_gumbel_screen_kernel with strided request-index and position columns (no
+    per-step .contiguous() copies); every arithmetic line is _gumbel_screen_kernel's.
+
+    Per-block (max, lowest argmax) of the fp32 Gumbel-noised logits, the
+    values _gumbel_sample_kernel produces, at a fraction of the arithmetic.
+
+    The exact noise costs two libdevice logf per token. Here every token gets
+    the cheap _approx_gumbel_noise32, within _APPROX_GUMBEL_ERR of the exact
+    noise, which bounds every exact noised logit to within a tolerance of its
+    approximation. Only tokens whose approximation comes within twice that
+    tolerance of the block's approximate max can hold the exact max. Almost
+    always that is a single token; the block then records it as pending and
+    _gumbel_finalize_kernel computes its exact value. With a few candidates
+    the block evaluates them exactly here, and with many (or a non-finite
+    max) it falls back to exact noise for every token. Either way the
+    resulting block max and its lowest token index are exact.
+
+    With HAS_BIAS the sampled (and cached) logits are logits + bias, rounded
+    to the logits dtype like the PyTorch add they replace.
+    """
+    token_idx = tl.program_id(0).to(tl.int64)
+    block_idx = tl.program_id(1)
+    block = block_idx * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+    mask = block < vocab_size
+    row_ptr = logits_ptr + token_idx * logits_stride
+    bias_row_ptr = bias_ptr + token_idx * bias_stride
+    raw = tl.load(row_ptr + block, mask=mask, other=float("-inf"))
+    if HAS_BIAS:
+        raw = (
+            raw.to(tl.float32)
+            + tl.load(bias_row_ptr + block, mask=mask, other=0.0).to(tl.float32)
+        ).to(logits_ptr.dtype.element_ty)
+
+    req_state_idx = tl.load(expanded_idx_mapping_ptr + token_idx * idx_stride).to(tl.int64)
+    is_valid_req = req_state_idx >= 0
+    temp = tl.load(temp_ptr + req_state_idx, mask=is_valid_req, other=0.0).to(
+        tl.float32
+    )
+    if logits_cache_ptr is not None:
+        # Pre-temperature logits; see gumbel_block_argmax.
+        if PER_TOKEN_COL:
+            col = tl.load(logits_cache_col_ptr + token_idx)
+        else:
+            col = tl.load(logits_cache_col_ptr)
+        row = draft_logits_row(req_state_idx, logits_cache_row_mapping_ptr)
+        tl.store(
+            logits_cache_ptr
+            + row * logits_cache_stride_0
+            + col * logits_cache_stride_1
+            + block,
+            raw,
+            mask=mask & (row >= 0),
+        )
+
+    x = raw.to(tl.float32)
+    pending = 0
+    if temp == 0.0:
+        value, idx = tl.max(x, axis=0, return_indices=True)
+    else:
+        if APPLY_TEMPERATURE:
+            x = x / temp
+        seed = tl.load(seeds_ptr + req_state_idx, mask=is_valid_req, other=0)
+        if logits_cache_ptr is not None:
+            # Same per-step stream as gumbel_block_argmax.
+            seed = spec_step_seed(seed, col)
+        pos = tl.load(pos_ptr + token_idx * pos_stride)
+        if IS_DRAFTING:
+            pos = pos + _DRAFT_NOISE_SALT
+        u = _uniform32_from_random(murmur3_hash32(seed, pos, block))
+        # Masked lanes hold -inf logits, so their approximation is -inf too.
+        approx = x + _approx_gumbel_noise32(u)
+        approx_max, approx_idx = tl.max(approx, axis=0, return_indices=True)
+        # |exact - approx| <= E + fp32 rounding of the add, per token, so any
+        # token whose exact value can reach the exact max lies within twice
+        # that of the approximate max.
+        tol = 2.5 * _APPROX_GUMBEL_ERR + tl.abs(approx_max) * 9.5367431640625e-07
+        # `not <` also selects NaN, which forces the exact fallback below.
+        candidates = ~(approx < approx_max - tol)
+        num_candidates = tl.sum(candidates.to(tl.int32))
+        finite = tl.abs(approx_max) < 3.0e38
+        if approx_max == float("-inf"):
+            # Every logit is -inf (e.g. a top-k draft): so is every noised
+            # logit, and tl.max picks index 0.
+            value = -float("inf")
+            idx = 0
+        elif (num_candidates == 1) & finite:
+            value = approx_max
+            idx = approx_idx
+            pending = 1
+        elif (num_candidates <= MAX_CANDIDATES) & finite:
+            # Candidates in increasing token order; strict `>` keeps the
+            # lowest index among equal maxima, like tl.max.
+            value = -float("inf")
+            idx = 0
+            prev = -1
+            for _ in range(num_candidates):
+                token_id = tl.min(
+                    tl.where(candidates & (block > prev), block, 2147483647)
+                )
+                v = _screened_exact_noised_logit(
+                    row_ptr,
+                    bias_row_ptr,
+                    token_id,
+                    True,
+                    seed,
+                    pos,
+                    temp,
+                    HAS_BIAS=HAS_BIAS,
+                    APPLY_TEMPERATURE=APPLY_TEMPERATURE,
+                )
+                if v > value:
+                    value = v
+                    idx = token_id - block_idx * BLOCK_SIZE
+                prev = token_id
+        else:
+            exact = tl.where(mask, x + gumbel_noise32(u), float("-inf"))
+            value, idx = tl.max(exact, axis=0, return_indices=True)
+    out = token_idx * local_stride + block_idx
+    tl.store(local_value_ptr + out, value)
+    tl.store(local_token_ptr + out, block_idx * BLOCK_SIZE + idx)
+    tl.store(local_pending_ptr + out, pending)
+
+
+@triton.jit
+def _gumbel_finalize_kernel_m1(
+    sampled_ptr,
+    # Optional [num_tokens] fp32: the row's max noised logit (for tests).
+    sampled_value_ptr,
+    local_value_ptr,
+    local_token_ptr,
+    local_pending_ptr,
+    local_stride,
+    num_blocks,
+    logits_ptr,
+    logits_stride,
+    bias_ptr,
+    bias_stride,
+    expanded_idx_mapping_ptr,
+    seeds_ptr,
+    pos_ptr,
+    temp_ptr,
+    # Scalar or [num_tokens] cache column; mixed into the seed when HAS_CACHE.
+    logits_cache_col_ptr,
+    idx_stride,
+    pos_stride,
+    out_tok_ptr,
+    out_tok_stride,
+    emb_w_ptr,
+    emb_out_ptr,
+    emb_out_stride,
+    IS_DRAFTING: tl.constexpr,
+    APPLY_TEMPERATURE: tl.constexpr,
+    HAS_BIAS: tl.constexpr,
+    HAS_CACHE: tl.constexpr,
+    PER_TOKEN_COL: tl.constexpr,
+    PADDED_NUM_BLOCKS: tl.constexpr,
+    HAS_OUT_TOK: tl.constexpr,
+    HAS_EMB: tl.constexpr,
+    RANK: tl.constexpr,
+):
+    """Exact values of the pending blocks, then the row argmax (lowest block
+    on ties, like torch.argmax over the reference kernel's block maxima)."""
+    token_idx = tl.program_id(0).to(tl.int64)
+    blocks = tl.arange(0, PADDED_NUM_BLOCKS)
+    bmask = blocks < num_blocks
+    base = token_idx * local_stride
+    value = tl.load(local_value_ptr + base + blocks, mask=bmask, other=-float("inf"))
+    token = tl.load(local_token_ptr + base + blocks, mask=bmask, other=0)
+    pending = tl.load(local_pending_ptr + base + blocks, mask=bmask, other=0) != 0
+    if tl.max(pending.to(tl.int32)) > 0:
+        req_state_idx = tl.load(expanded_idx_mapping_ptr + token_idx * idx_stride).to(tl.int64)
+        is_valid_req = req_state_idx >= 0
+        temp = tl.load(temp_ptr + req_state_idx, mask=is_valid_req, other=0.0).to(
+            tl.float32
+        )
+        seed = tl.load(seeds_ptr + req_state_idx, mask=is_valid_req, other=0)
+        if HAS_CACHE:
+            if PER_TOKEN_COL:
+                col = tl.load(logits_cache_col_ptr + token_idx)
+            else:
+                col = tl.load(logits_cache_col_ptr)
+            seed = spec_step_seed(seed, col)
+        pos = tl.load(pos_ptr + token_idx * pos_stride)
+        if IS_DRAFTING:
+            pos = pos + _DRAFT_NOISE_SALT
+        exact = _screened_exact_noised_logit(
+            logits_ptr + token_idx * logits_stride,
+            bias_ptr + token_idx * bias_stride,
+            token,
+            pending,
+            seed,
+            pos,
+            temp,
+            HAS_BIAS=HAS_BIAS,
+            APPLY_TEMPERATURE=APPLY_TEMPERATURE,
+        )
+        value = tl.where(pending, exact, value)
+    best = tl.argmax(value, axis=0)
+    sampled_tok = tl.sum(tl.where(blocks == best, token, 0))
+    tl.store(sampled_ptr + token_idx, sampled_tok)
+    # Fused Markov step: the draft-token column write and the next step's Markov embedding row
+    # (markov_w1[token], what nn.Embedding returns) move into this kernel: data movement only.
+    if HAS_OUT_TOK:
+        tl.store(out_tok_ptr + token_idx * out_tok_stride, sampled_tok.to(out_tok_ptr.dtype.element_ty))
+    if HAS_EMB:
+        k = tl.arange(0, RANK)
+        e = tl.load(emb_w_ptr + sampled_tok.to(tl.int64) * RANK + k)
+        tl.store(emb_out_ptr + token_idx * emb_out_stride + k, e)
+    if sampled_value_ptr is not None:
+        tl.store(sampled_value_ptr + token_idx, tl.max(value, axis=0))
+
+def gumbel_sample_markov_m1(
+    logits: torch.Tensor,  # [num_tokens, vocab_size], stride(-1) == 1
+    logits_bias: torch.Tensor,  # [num_tokens, vocab_size]
+    idx_col: torch.Tensor,  # [num_tokens] (may be a strided column)
+    temperature: torch.Tensor,
+    seed: torch.Tensor,
+    pos_col: torch.Tensor,  # [num_tokens] the position before the sampled token (may be strided)
+    apply_temperature: bool,
+    is_drafting: bool,
+    logits_cache: torch.Tensor,
+    logits_cache_col: torch.Tensor,
+    logits_cache_row_mapping: torch.Tensor | None,
+    out_tok_col: torch.Tensor | None,  # [num_tokens] column of draft_tokens (strided)
+    emb_w: torch.Tensor | None,  # [vocab, RANK] markov_w1 weight, contiguous
+    emb_out: torch.Tensor | None,  # [num_tokens, RANK]
+    block_size: int = _SCREENED_BLOCK_SIZE,
+    num_warps: int = _SCREENED_NUM_WARPS,
+) -> torch.Tensor:
+    """_gumbel_sample_screened for one Markov step, without the per-step .contiguous()
+    copies of the request-index and position columns, writing the sampled token into the draft-token column
+    and (when emb_w is given) the next step's Markov embedding. Same arithmetic as the screened kernels."""
+    num_tokens, vocab_size = logits.shape
+    if logits_cache_col is not None:
+        logits_cache_col = logits_cache_col.contiguous()
+    bias = logits_bias
+    bias_stride = logits_bias.stride(0)
+    num_blocks = triton.cdiv(vocab_size, block_size)
+    local_value = logits.new_empty(num_tokens, num_blocks, dtype=torch.float32)
+    local_token = logits.new_empty(num_tokens, num_blocks, dtype=torch.int32)
+    local_pending = logits.new_empty(num_tokens, num_blocks, dtype=torch.int8)
+    per_token_col = logits_cache_col is not None and logits_cache_col.dim() > 0
+    _gumbel_screen_kernel_m1[(num_tokens, num_blocks)](
+        local_value, local_token, local_pending, local_value.stride(0),
+        logits_cache,
+        logits_cache.stride(0) if logits_cache is not None else 0,
+        logits_cache.stride(1) if logits_cache is not None else 0,
+        logits_cache_col, logits_cache_row_mapping,
+        logits, logits.stride(0), bias, bias_stride,
+        idx_col, seed, pos_col, temperature, vocab_size,
+        idx_col.stride(0), pos_col.stride(0),
+        BLOCK_SIZE=block_size, IS_DRAFTING=is_drafting, APPLY_TEMPERATURE=apply_temperature,
+        PER_TOKEN_COL=per_token_col, HAS_BIAS=True, MAX_CANDIDATES=16, num_warps=num_warps,
+    )
+    sampled = logits.new_empty(num_tokens, dtype=torch.int64)
+    rank = emb_w.shape[1] if emb_w is not None else 1
+    _gumbel_finalize_kernel_m1[(num_tokens,)](
+        sampled, None, local_value, local_token, local_pending, local_value.stride(0), num_blocks,
+        logits, logits.stride(0), bias, bias_stride,
+        idx_col, seed, pos_col, temperature, logits_cache_col,
+        idx_col.stride(0), pos_col.stride(0),
+        out_tok_col, out_tok_col.stride(0) if out_tok_col is not None else 0,
+        emb_w, emb_out, emb_out.stride(0) if emb_out is not None else 0,
+        IS_DRAFTING=is_drafting, APPLY_TEMPERATURE=apply_temperature, HAS_BIAS=True,
+        HAS_CACHE=logits_cache is not None, PER_TOKEN_COL=per_token_col,
+        PADDED_NUM_BLOCKS=triton.next_power_of_2(num_blocks),
+        HAS_OUT_TOK=out_tok_col is not None, HAS_EMB=emb_w is not None, RANK=rank, num_warps=1,
+    )
+    return sampled

@@ -44,6 +44,12 @@ from vllm.v1.worker.gpu.sample.batch_shard import (
 )
 from vllm.v1.worker.gpu.sample.greedy_argmax import greedy_argmax
 from vllm.v1.worker.gpu.sample.gumbel import gumbel_sample
+import os as _os
+
+# Fused Markov-step data movement (bitwise to _sample_markov_chain_x4). Off by default.
+_MOSCA_MARKOV_FUSE = _os.environ.get("VLLM_MOSCA_MARKOV_FUSE", "0") == "1"
+if _MOSCA_MARKOV_FUSE:
+    from vllm.v1.worker.gpu.sample import gumbel as _mosca_gm1  # noqa: E402  (must carry gumbel_sample_markov_m1)
 from vllm.v1.worker.gpu.spec_decode.dflash.speculator import DFlashSpeculator
 from vllm.v1.worker.gpu.spec_decode.dspark.utils import load_dspark_model
 
@@ -287,6 +293,78 @@ class DSparkSpeculator(DFlashSpeculator):
             self.draft_token_confidence_probs[:num_reqs] = confidence
 
     def _sample_markov_chain(
+        self,
+        base_logits: torch.Tensor,
+        hidden: torch.Tensor,
+        prev: torch.Tensor,
+        idx_map: torch.Tensor,
+        sample_pos: torch.Tensor,
+        out_tokens: torch.Tensor,
+    ) -> torch.Tensor | None:
+        """The Markov steps with fused data movement, on top of Zhihan Jiang's 4326ff5d1d and 20d8cf4d01.
+
+        Per Markov step the unfused loop (_sample_markov_chain_x4) launches, besides the bias GEMM and the
+        screened Gumbel pair: the Markov
+        embedding gather, `sample_pos[:, i] - 1`, the `.contiguous()` copy of `idx_map[:, i]` and the
+        `out_tokens[:, i] = ...` copy. Here the position offset is one launch for all steps, the screened
+        kernels read the strided columns directly, and the finalize kernel writes the draft-token column and
+        the next step's Markov embedding (markov_w1[token]). Data movement only: tokens, draft-logits cache
+        and every bias GEMM input are bitwise the unfused loop's. Any other configuration takes that loop.
+        """
+        gm1 = globals().get("_mosca_gm1") if _MOSCA_MARKOV_FUSE else None
+        try:
+            w1 = self.model.model.markov_head.markov_w1.weight
+        except AttributeError:
+            w1 = None
+        logits_ok = base_logits.stride(-1) == 1 and base_logits.dtype in (torch.float32, torch.bfloat16, torch.float16)
+        fused = (
+            gm1 is not None
+            and w1 is not None
+            and w1.is_contiguous()
+            and (w1.shape[1] & (w1.shape[1] - 1)) == 0
+            and not self.use_confidence_head
+            and not hasattr(self.model, "apply_output_logit_transform")
+            and self.acceptance_estimator is None
+            and self.draft_logits is not None
+            and self._d2t_scatter_index is None
+            and self.draft_watermarker is None
+            and not self.use_fp64_gumbel
+            and logits_ok
+            and base_logits.is_cuda
+        )
+        self._mosca_m1_path = "fused" if fused else "x4"
+        if not fused:
+            return self._sample_markov_chain_x4(base_logits, hidden, prev, idx_map, sample_pos, out_tokens)
+        n = self.num_speculative_steps
+        pos_m1 = sample_pos - 1  # one launch for every step
+        emb = self.model.markov_embed(prev)  # step 0: the anchor token's embedding
+        emb_next = torch.empty_like(emb)
+        for i in range(n):
+            bias = self.model.markov_bias(emb)
+            logits_i = base_logits[:, i]
+            if not (bias.shape == logits_i.shape and bias.dtype == logits_i.dtype and bias.stride(-1) == 1):
+                raise RuntimeError("mosca_m1: bias layout differs from the screened kernel's contract")
+            last = i == n - 1
+            gm1.gumbel_sample_markov_m1(
+                logits_i,
+                bias,
+                idx_map[:, i],
+                self.temperature,
+                self.seeds,
+                pos_m1[:, i],
+                True,
+                True,
+                self.draft_logits.values,
+                self._step_cols[i],
+                self.draft_logits.row_mapping,
+                out_tokens[:, i],
+                None if last else w1,
+                None if last else emb_next,
+            )
+            emb, emb_next = emb_next, emb
+        return None
+
+    def _sample_markov_chain_x4(
         self,
         base_logits: torch.Tensor,
         hidden: torch.Tensor,
