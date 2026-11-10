@@ -209,10 +209,14 @@ def mhc_shifted_post_pre(
     *,
     stream: torch.cuda.Stream | None = None,
     reduce_results: bool = False,
+    mxfp8_out: list | None = None,
 ) -> tuple[
     torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor
 ]:
     """Dispatch shifted post/pre to overlap, Mega-mHC, or fused TileLang.
+
+    ``mxfp8_out``: on the Mega-mHC path, also receive y as a FlashInfer-format
+    MXFP8 QuantizedActivation (the list stays empty on every other path).
 
     A MoE output left unfinalized is finalized inside the fused all-reduce.
     When stream is supplied, join it before consuming the returned coefficients.
@@ -300,6 +304,7 @@ def mhc_shifted_post_pre(
             sinkhorn_repeat,
             norm_weight,
             norm_eps,
+            mxfp8_out=mxfp8_out,
         )
         return *outputs, x.new_empty(0, x.shape[1])
 

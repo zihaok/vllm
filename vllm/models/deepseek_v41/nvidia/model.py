@@ -361,6 +361,7 @@ class DeepseekV4DecoderLayer(nn.Module):
                 # forward keeps the separate reduce-scatter below.
                 self.attn.bind_gemm_rs()
         self.attn.shard_fused_wqa_wkv = _shard_fused_wqa_wkv(vllm_config)
+        self._mxfp8_wqa_wkv_input: bool | None = None
         self.ffn = DeepseekV4MoE(
             vllm_config,
             prefix=f"{prefix}.ffn",
@@ -600,6 +601,7 @@ class DeepseekV4DecoderLayer(nn.Module):
         else:
             # The collapse already reads the post-mapped streams, so the mean
             # aux consumers want comes out of the same kernel.
+            mxfp8_out = [] if self._takes_mxfp8_wqa_wkv_input() else None
             residual, post_mix, res_mix, x, attn_pre, aux = mhc_shifted_post_pre(
                 x,
                 residual,
@@ -619,7 +621,10 @@ class DeepseekV4DecoderLayer(nn.Module):
                 capture_aux=capture_previous_aux,
                 stream=mhc_stream,
                 reduce_results=self.fuse_mhc_all_reduce,
+                mxfp8_out=mxfp8_out,
             )
+            if mxfp8_out:
+                self.attn.pre_quantized_input = mxfp8_out[0]
             if capture_previous_aux:
                 previous_aux = aux
 
@@ -661,6 +666,24 @@ class DeepseekV4DecoderLayer(nn.Module):
         if mhc_stream is not None:
             torch.cuda.current_stream().wait_stream(mhc_stream)
         return x, residual, post_mix, res_mix, ffn_pre, previous_aux
+
+    def _takes_mxfp8_wqa_wkv_input(self) -> bool:
+        """Whether fused_wqa_wkv consumes FlashInfer-format MXFP8 (the format Mega mHC
+        can emit). Same consumer rule as common/ops/query_quant.can_fuse_query_quant."""
+        if self._mxfp8_wqa_wkv_input is None:
+            from vllm.models.deepseek_v41.common.ops.query_quant import (
+                can_fuse_query_quant,
+            )
+
+            from .ops.mega_mhc import mega_mhc_supports_mxfp8_y
+
+            self._mxfp8_wqa_wkv_input = bool(
+                not self.attn.shard_fused_wqa_wkv
+                and not self.use_sequence_parallel
+                and mega_mhc_supports_mxfp8_y()
+                and can_fuse_query_quant([self.attn.fused_wqa_wkv])
+            )
+        return self._mxfp8_wqa_wkv_input
 
     def write_kv(
         self,

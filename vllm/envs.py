@@ -214,6 +214,7 @@ if TYPE_CHECKING:
     ] = "relax"
     VLLM_USE_FUSED_MOE_GROUPED_TOPK: bool = True
     VLLM_MOE_SKIP_PADDING: bool = True
+    VLLM_MOSCA_MEGAMOE_PDL: bool = False
     VLLM_STEP5_SHARD_SP_SHARED_EXPERT: bool = False
     VLLM_KIMI_K3_SHARD_SP_SHARED_EXPERT: bool = False
     VLLM_KIMI_K3_AUX_ATTN_RES_STREAM: bool = False
@@ -1679,6 +1680,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # treats topk_id == -1 as a skip sentinel. Supported CUDA grouped routers
     # fuse this into routing; the existing backend opt-in is still required.
     "VLLM_MOE_SKIP_PADDING": lambda: bool(int(os.getenv("VLLM_MOE_SKIP_PADDING", "1"))),
+    # Build the MegaMoE kernel variants with the programmatic-dependent-launch attribute (plugin
+    # sm107_megamoe KernelOptions.pdl), so the MegaMoE prologue overlaps the tail of the kernel before it.
+    "VLLM_MOSCA_MEGAMOE_PDL": lambda: bool(int(os.getenv("VLLM_MOSCA_MEGAMOE_PDL", "0"))),
     # Step5 SP dense/shared MLPs: opt into TP-sharded weights with AG/RS
     # instead of replicated weights and local-token computation.
     "VLLM_STEP5_SHARD_SP_SHARED_EXPERT": lambda: bool(

@@ -85,6 +85,15 @@ class UnquantizedEmbeddingMethod(QuantizeMethodBase):
             current_platform.is_cuda_alike() or current_platform.is_xpu()
         ):
             return linear_batch_invariant(x, layer.weight, bias)
+        if bias is None and current_platform.is_cuda() and isinstance(layer, ParallelLMHead):
+            # Off unless VLLM_MOSCA_LMHEAD_TABLE is set: the lm_head tactic per row count from a
+            # measured table; None keeps the served call below.
+            from vllm.model_executor.layers import mosca_lmhead_lt
+
+            lt = mosca_lmhead_lt.get()
+            y = lt.maybe(x, layer.weight) if lt is not None else None
+            if y is not None:
+                return y
         return dispatch_unquantized_gemm()(layer, x, layer.weight, bias)
 
     def embedding(self, layer: torch.nn.Module, input_: torch.Tensor) -> torch.Tensor:

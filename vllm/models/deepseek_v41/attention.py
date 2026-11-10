@@ -413,6 +413,9 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
         self.gemm_rs: GemmRsAr | None = None
         # Set by the NVIDIA decoder layer from _shard_fused_wqa_wkv.
         self.shard_fused_wqa_wkv = False
+        # Set by the NVIDIA decoder layer right before forward: the MXFP8
+        # QuantizedActivation of hidden_states produced by the Mega mHC kernel.
+        self.pre_quantized_input = None
 
         # Initialize rotary embedding before the indexer/compressor consume it.
         self.rotary_emb = build_deepseek_v4_rope(
@@ -968,6 +971,11 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
         # Override point: the ROCm layer preshuffles this weight in place, so
         # it cannot go through fused_wqa_wkv directly.
         num_tokens = hidden_states.shape[0]
+        qa, self.pre_quantized_input = self.pre_quantized_input, None
+        if qa is not None and tuple(qa.orig_shape) == tuple(hidden_states.shape):
+            # The producer already quantized hidden_states in this kernel's format.
+            qr_kv, _ = self.fused_wqa_wkv(qa)
+            return qr_kv
         # MergedColumnParallelLinear returns (output, bias); bias is None.
         if self.shard_fused_wqa_wkv and num_tokens >= _SHARD_FUSED_WQA_WKV_MIN_TOKENS:
             qr_kv, _ = self.fused_wqa_wkv(sp_shard(hidden_states))
