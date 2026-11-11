@@ -43,6 +43,7 @@ if TYPE_CHECKING:
     from vllm.model_executor.layers.rocm_paged_mxfp4_indexer import (
         RocmSparseMQAIndexer,
     )
+    from vllm.models.deepseek_v41.common.ops.query_quant import Mxfp8KVInsert
     from vllm.v1.attention.backends.mla.sparse_swa import (
         DeepseekSparseSWAMetadata,
     )
@@ -54,7 +55,7 @@ from vllm.config import (
 )
 from vllm.config.cache import CacheDType
 from vllm.distributed import get_pcp_group, get_tensor_model_parallel_world_size
-from vllm.forward_context import get_forward_context
+from vllm.forward_context import get_forward_context, is_forward_context_available
 from vllm.logger import init_logger
 from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
 from vllm.model_executor.layers.layernorm import RMSNorm
@@ -690,7 +691,9 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
         qr_kv, kv_score, indexer_weights = self._run_parallel_input_projections(
             hidden_states
         )
-        qr, qr_scale, kv = self._split_qkv_and_norm(qr_kv)
+        qr, qr_scale, kv = self._split_qkv_and_norm(
+            qr_kv, self._fused_kv_insert(positions)
+        )
 
         self._prepare_and_attn_fn(
             hidden_states,
@@ -803,13 +806,57 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
             linears.append(self.indexer.wq_b)
         return can_fuse_query_quant(linears)
 
+    @cached_property
+    def _can_fuse_kv_insert(self) -> bool:
+        """Whether the SWA KV insert can move into the Q/KV norm kernel: SM107,
+        the packed MXFP8 SWA record, an attention kernel that norms and ropes Q
+        itself at the shard's own head count (so the insert op would only write
+        the KV), no PCP gather, and the narrow eager region of model runner V2
+        (with V1's wide region the norm kernel is captured but the insert's
+        metadata is not graph-safe, see #51430). Opt-in: not bitwise with the
+        default path, so only with VLLM_DSV41_FUSED_QKV_NORM_KV_INSERT=1."""
+        return (
+            envs.VLLM_DSV41_FUSED_QKV_NORM_KV_INSERT
+            and current_platform.is_device_capability(107)
+            and self.kv_mxfp8
+            and self.accepts_unnormed_unroped_query
+            and self.n_local_heads == self.padded_heads
+            and not self.use_pcp
+            and self._prepare_and_attn_fn == self._prepare_and_attn
+            and self.q_lora_rank % 32 == 0
+            and self._can_fuse_query_quant
+        )
+
+    def _fused_kv_insert(self, positions: torch.Tensor) -> "Mxfp8KVInsert | None":
+        """The SWA KV insert ``_split_qkv_and_norm`` fuses into its norm kernel,
+        or None to keep it in ``_fused_qnorm_rope_kv_insert``."""
+        if not (self._can_fuse_kv_insert and is_forward_context_available()):
+            return None
+        attn_metadata = get_forward_context().attn_metadata
+        if not isinstance(attn_metadata, dict):
+            return None
+        swa_metadata = cast(Any, attn_metadata.get(self.swa_cache_layer.prefix))
+        cache = self.swa_cache_layer.kv_cache
+        if swa_metadata is None or cache.dtype != torch.uint8:
+            return None
+        from vllm.models.deepseek_v41.common.ops.query_quant import Mxfp8KVInsert
+
+        return Mxfp8KVInsert(
+            cache.view(cache.shape[0], -1),
+            swa_metadata.slot_mapping,
+            positions,
+            self.rotary_emb.cos_sin_cache,
+            swa_metadata.block_size,
+        )
+
     def _split_qkv_and_norm(
-        self, qr_kv: torch.Tensor
+        self, qr_kv: torch.Tensor, kv_insert: "Mxfp8KVInsert | None" = None
     ) -> tuple[torch.Tensor | QuantizedActivation, torch.Tensor | None, torch.Tensor]:
         """Split the fused q-lora / kv projection and RMSNorm both halves.
 
         Compatible MXFP8 projections share the quantized Q and scales;
         other projection backends consume the normalized Q directly.
+        ``kv_insert`` (from ``_fused_kv_insert``) is done here too.
         """
         qr, kv = qr_kv.split([self.q_lora_rank, self.head_dim], dim=-1)
         if self.q_lora_rank % 32 == 0 and self._can_fuse_query_quant:
@@ -823,8 +870,10 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
                 self.q_norm.weight.data,
                 self.kv_norm.weight.data,
                 self.eps,
+                kv_insert=kv_insert,
             )
             return qr_quant, None, kv
+        assert kv_insert is None
         qr, kv = fused_q_kv_rmsnorm(
             qr,
             kv,
@@ -1094,6 +1143,10 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
                 (0, 0, 0, self.padded_heads - self.n_local_heads),
                 value=0.0,
             )
+
+        if self._fused_kv_insert(positions) is not None:
+            # _split_qkv_and_norm inserted the KV, and Q is ready as is.
+            return q
 
         swa_metadata = cast(
             "DeepseekSparseSWAMetadata | None",

@@ -228,6 +228,7 @@ if TYPE_CHECKING:
     VLLM_FLASHINFER_AUTOTUNE_CACHE_DIR: str | None = None
     VLLM_SM107_MXFP8_CUDNN_MIN_ROWS: int = 0
     VLLM_SM107_MXFP8_CUDNN_MIN_K: int = 0
+    VLLM_DSV41_FUSED_QKV_NORM_KV_INSERT: bool = False
     VLLM_FLASHINFER_AUTOTUNE_SKIP_OPS: list[str] | None = None
     VLLM_FLASHINFER_ALLREDUCE_BACKEND: Literal["auto", "trtllm", "mnnvl"] = "auto"
     VLLM_FLASHINFER_WORKSPACE_BUFFER_SIZE: int = 394 * 1024 * 1024
@@ -1868,6 +1869,14 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ),
     "VLLM_SM107_MXFP8_CUDNN_MIN_K": lambda: int(
         os.getenv("VLLM_SM107_MXFP8_CUDNN_MIN_K", "0")
+    ),
+    # DeepSeek-V4.1: the 4-rows-per-program q/kv RMSNorm + MXFP8 quant Triton
+    # kernel, with the SM107 packed-MXFP8 SWA KV insert fused into it (Q is
+    # then passed to MegaAttn as is). Not bitwise with the default kernel
+    # (1-ulp reassociation of the Q rrms sum and of the KV row), so off by
+    # default: 0 keeps the per-row norm kernel and the CUDA SWA KV insert.
+    "VLLM_DSV41_FUSED_QKV_NORM_KV_INSERT": lambda: bool(
+        int(os.getenv("VLLM_DSV41_FUSED_QKV_NORM_KV_INSERT", "0"))
     ),
     # Comma-separated FlashInfer op names to exclude from autotuning, using
     # the heuristic fallback tactic instead. Unset: skip "fp4_gemm" when the
