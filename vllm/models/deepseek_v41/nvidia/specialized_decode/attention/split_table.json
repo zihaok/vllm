@@ -1,0 +1,7 @@
+{
+ "about": "Split rules (first match wins): the DSMEM push of FP16 partials (merge dsmem16) at 16 CTAs x 40 keys per token up to 6 rows and 8 x 80 keys up to 18 rows, index width 640; W = 128 and every call above 18 rows keep the FlashInfer kernel (no rule = admit refuses).",
+ "rules": [
+  {"width": 640, "max_rows": 6, "S": 16, "KPC": 40, "merge": "dsmem16"},
+  {"width": 640, "max_rows": 18, "S": 8, "KPC": 80, "merge": "dsmem16"}
+ ]
+}

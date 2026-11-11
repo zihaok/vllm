@@ -19,6 +19,7 @@ with two changes, neither of which issues a collective:
 """
 
 import inspect
+import os
 from functools import cache
 from typing import TYPE_CHECKING, cast
 
@@ -35,6 +36,23 @@ from ...flashinfer_sparse import (
 )
 
 logger = init_logger(__name__)
+
+# MOSCA sparse-MLA decode (VLLM_MOSCA_SPARSE_MLA_DECODE, default off): the decode calls the MOSCA kernel admits (mosca_smla.py next
+# to this file: FP8 query and KV, 16 heads, cum_seq_lens_q given, float scales, index width >= 128) run the MOSCA kernel instead of
+# FlashInfer TRT-LLM-gen; every other call, and every call with the switch off, stays on FlashInfer. mosca_smla.census logs the routing.
+MOSCA_SPARSE_MLA_DECODE = os.environ.get("VLLM_MOSCA_SPARSE_MLA_DECODE", "0") == "1"
+
+
+def _mosca_decode(**kw) -> bool:
+    """MOSCA (VLLM_MOSCA_SPARSE_MLA_DECODE): run the call on the MOSCA kernel when it admits it; False keeps the FlashInfer call."""
+    from . import mosca_smla
+
+    reason = mosca_smla.admit(**kw)
+    mosca_smla.census(kw["query"].shape[0], kw["sparse_indices"].shape[-1], reason)
+    if reason is not None:
+        return False
+    mosca_smla.run(**kw)
+    return True
 
 if TYPE_CHECKING:
     from vllm.v1.attention.backends.mla.sparse_swa import DeepseekSparseSWAMetadata
@@ -116,6 +134,12 @@ def trtllm_decode_sparse_mla_dsv4(
     """``trtllm_batch_decode_sparse_mla_dsv4`` for ``sparse_indices`` that are
     KV storage offsets, on ``kv_counters`` (from ``kv_counter_buffer``) when
     they are large enough for the launch."""
+    if MOSCA_SPARSE_MLA_DECODE and _mosca_decode(
+        query=query, swa_kv_cache=swa_kv_cache, compressed_kv_cache=compressed_kv_cache, sparse_indices=sparse_indices,
+        sparse_topk_lens=sparse_topk_lens, seq_lens=seq_lens, out=out, bmm1_scale=bmm1_scale, bmm2_scale=bmm2_scale, sinks=sinks,
+        cum_seq_lens_q=cum_seq_lens_q,
+    ):
+        return
     counter_kwargs: dict[str, torch.Tensor] = {}
     if kv_counters is not None:
         from flashinfer.utils import (
