@@ -1,8 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import functools
+
 import torch
 
+import vllm.envs as envs
 from vllm.model_executor.layers.fusion.quant_activation import (
     QuantizedActivation,
     as_quantized_activation,
@@ -22,6 +25,23 @@ from vllm.utils import flashinfer as vllm_flashinfer
 from vllm.utils.flashinfer import has_flashinfer, has_flashinfer_cutedsl
 
 from .Mxfp8LinearKernel import Mxfp8LinearKernel, Mxfp8LinearLayerConfig
+
+
+@functools.cache
+def _sm107_cudnn_min_rows_and_k() -> tuple[int, int]:
+    """(rows, K) from which SM107 MXFP8 linears run cuDNN's MXFP8 GEMM; rows 0
+    keeps CuTe-DSL everywhere (VLLM_SM107_MXFP8_CUDNN_MIN_ROWS / _MIN_K)."""
+    if not current_platform.is_device_capability(107):
+        return 0, 0
+    return envs.VLLM_SM107_MXFP8_CUDNN_MIN_ROWS, envs.VLLM_SM107_MXFP8_CUDNN_MIN_K
+
+
+def _mm_mxfp8_backend(rows: int, k: int) -> str:
+    # On SM107 cuDNN's MXFP8 GEMM beats FlashInfer's CuTe-DSL kernels for large
+    # rows at large K (DSV4.1 wo_b, K 8192: -10% at 7424 rows, -19% at 12288),
+    # not at K 1280 (wq_b even, indexer wq_b +10-15%). Bitwise-equal outputs.
+    min_rows, min_k = _sm107_cudnn_min_rows_and_k()
+    return "cudnn" if 0 < min_rows <= rows and k >= min_k else "cute-dsl"
 
 
 def _check_mm_mxfp8_shape(weight_shape: tuple[int, int]) -> tuple[bool, str | None]:
@@ -188,7 +208,7 @@ class FlashInferCutedslMxfp8LinearKernel(Mxfp8LinearKernel):
             input_scale,
             weight_scale,
             out_dtype=out_dtype,
-            backend="cute-dsl",
+            backend=_mm_mxfp8_backend(input_mxfp8.shape[0], K),
         )
 
         if bias is not None:

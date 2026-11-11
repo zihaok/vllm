@@ -226,6 +226,8 @@ if TYPE_CHECKING:
     VLLM_FLASHINFER_CUTEDSL_MOE_LOCALIZE_MEMSET_OVERLAP: bool = True
     VLLM_FLASHINFER_CUTEDSL_MOE_LOCALIZE_FREE_FULL_WEIGHTS: bool = False
     VLLM_FLASHINFER_AUTOTUNE_CACHE_DIR: str | None = None
+    VLLM_SM107_MXFP8_CUDNN_MIN_ROWS: int = 0
+    VLLM_SM107_MXFP8_CUDNN_MIN_K: int = 0
     VLLM_FLASHINFER_AUTOTUNE_SKIP_OPS: list[str] | None = None
     VLLM_FLASHINFER_ALLREDUCE_BACKEND: Literal["auto", "trtllm", "mnnvl"] = "auto"
     VLLM_FLASHINFER_WORKSPACE_BUFFER_SIZE: int = 394 * 1024 * 1024
@@ -1857,6 +1859,15 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Override the directory for the FlashInfer autotune config cache.
     "VLLM_FLASHINFER_AUTOTUNE_CACHE_DIR": lambda: os.getenv(
         "VLLM_FLASHINFER_AUTOTUNE_CACHE_DIR", None
+    ),
+    # SM107: FlashInfer CuTe-DSL MXFP8 linears with at least this many rows
+    # (and a K of at least VLLM_SM107_MXFP8_CUDNN_MIN_K) run FlashInfer's cuDNN
+    # MXFP8 GEMM instead. 0 (default) keeps every row count on CuTe-DSL.
+    "VLLM_SM107_MXFP8_CUDNN_MIN_ROWS": lambda: int(
+        os.getenv("VLLM_SM107_MXFP8_CUDNN_MIN_ROWS", "0")
+    ),
+    "VLLM_SM107_MXFP8_CUDNN_MIN_K": lambda: int(
+        os.getenv("VLLM_SM107_MXFP8_CUDNN_MIN_K", "0")
     ),
     # Comma-separated FlashInfer op names to exclude from autotuning, using
     # the heuristic fallback tactic instead. Unset: skip "fp4_gemm" when the
