@@ -25,8 +25,19 @@ backbone forward AND the sequential Markov sampling.
 Under batch-sharded sampling, draft steps also shard the sequential sampling
 across TP ranks: each rank runs the Markov loop only for the requests it owns
 (the same owners as verification), see ``_sample_sequential_sharded``.
+
+With a replicated draft-logits cache and a probabilistic draft, the Markov loop
+runs fused (``fused_sample.py``, see ``_sample_sequential_fused``): per position
+the bias GEMM and two kernels, drawing by inverse CDF from the same
+softmax(logits / T) of the cached logits that the eager loop's Gumbel-max
+draws from and the rejection sampler verifies against. Every other case (and
+VLLM_DSPARK_FUSED_MARKOV=0) keeps the eager loop, ``_sample_markov_chain``:
+step-major base logits and the screened Gumbel kernel with the Markov-bias add
+fused in. Both paths cache the same logits (base + bias, rounded once to the
+cache dtype, pre-temperature) at [request state, step].
 """
 
+import os
 from typing import Any
 
 import torch
@@ -36,6 +47,7 @@ from vllm.config.compilation import CUDAGraphMode
 from vllm.distributed.device_communicators.pynccl import PyNcclCommunicator
 from vllm.distributed.parallel_state import get_tp_group
 from vllm.logger import init_logger
+from vllm.platforms import current_platform
 from vllm.utils.math_utils import cdiv
 from vllm.v1.worker.gpu.sample.batch_shard import (
     all_to_all_vocab_shards,
@@ -45,6 +57,10 @@ from vllm.v1.worker.gpu.sample.batch_shard import (
 from vllm.v1.worker.gpu.sample.greedy_argmax import greedy_argmax
 from vllm.v1.worker.gpu.sample.gumbel import gumbel_sample
 from vllm.v1.worker.gpu.spec_decode.dflash.speculator import DFlashSpeculator
+from vllm.v1.worker.gpu.spec_decode.dspark.fused_sample import (
+    FUSED_MAX_REQS,
+    DSparkFusedMarkovSampler,
+)
 from vllm.v1.worker.gpu.spec_decode.dspark.utils import load_dspark_model
 
 logger = init_logger(__name__)
@@ -97,6 +113,10 @@ class DSparkSpeculator(DFlashSpeculator):
         # Set when the sequential sampling can be batch-sharded across TP.
         self._sharded_sequential_comm: PyNcclCommunicator | None = None
 
+        # Set in load_model when the fused loop draws what the eager one does.
+        self._fused_sampler: DSparkFusedMarkovSampler | None = None
+        self._markov_bias_weight: torch.Tensor | None = None
+
     def load_model(self, target_model: torch.nn.Module) -> None:
         super().load_model(target_model)
         tp_size = get_tp_group().world_size
@@ -104,6 +124,56 @@ class DSparkSpeculator(DFlashSpeculator):
             self.vllm_config, target_model
         ):
             self._try_enable_sharded_sequential_sampling()
+        # After super().load_model: the draft logits cache is allocated there.
+        self._try_enable_fused_markov_sampling()
+
+    def _try_enable_fused_markov_sampling(self) -> None:
+        if os.environ.get("VLLM_DSPARK_FUSED_MARKOV", "1") == "0":
+            return
+        model = self.model
+        get_embed_weight = getattr(model, "markov_embed_weight", None)
+        draft_vocab_size = (
+            getattr(self.draft_model_config.hf_config, "draft_vocab_size", None)
+            or self.vocab_size
+        )
+        if not (
+            get_embed_weight is not None
+            and current_platform.is_cuda()
+            and self.draft_logits is not None
+            # A replicated cache, indexed by request state.
+            and self.draft_logits.row_mapping is None
+            and self.draft_logits.values.shape[-1] == draft_vocab_size
+            and self._sharded_sequential_comm is None
+            and self._draft_topk is None
+            and self._d2t_scatter_index is None
+            and self.draft_watermarker is None
+            # No consumer of the materialized logits besides the sampler.
+            and self.acceptance_estimator is None
+            and not self.use_confidence_head
+            and not self.enable_adaptive_verification
+            # The fused sampler draws by inverse CDF; fp64 Gumbel keeps the loop.
+            and not self.use_fp64_gumbel
+            and not hasattr(model, "apply_output_logit_transform")
+            and not hasattr(model, "sample_sequential")
+        ):
+            return
+        embed_weight = get_embed_weight()
+        if embed_weight is None or embed_weight.dim() != 2:
+            return
+        if embed_weight.stride(1) != 1:
+            return
+        self._fused_sampler = DSparkFusedMarkovSampler(
+            self.max_num_reqs, draft_vocab_size, embed_weight
+        )
+        # The sampler can also run the bias GEMM of an unquantized projection.
+        get_bias_weight = getattr(model, "markov_bias_gemm_weight", None)
+        self._markov_bias_weight = get_bias_weight() if get_bias_weight else None
+        logger.info(
+            "DSpark sequential sampling runs fused (inverse-CDF draws; bias GEMM "
+            "inside the sampling kernel up to %d requests: %s).",
+            FUSED_MAX_REQS,
+            self._markov_bias_weight is not None,
+        )
 
     def _try_enable_sharded_sequential_sampling(self) -> None:
         tp_size = get_tp_group().world_size
@@ -240,6 +310,9 @@ class DSparkSpeculator(DFlashSpeculator):
         )
 
     def _sample_sequential(self, num_reqs: int, head_hidden: torch.Tensor) -> None:
+        if self._fused_sampler is not None:
+            self._sample_sequential_fused(num_reqs, head_hidden)
+            return
         if self._draft_topk is not None:
             self._sample_sequential_topk(num_reqs, head_hidden)
             return
@@ -285,6 +358,52 @@ class DSparkSpeculator(DFlashSpeculator):
         )
         if confidence is not None:
             self.draft_token_confidence_probs[:num_reqs] = confidence
+
+    def _sample_sequential_fused(
+        self, num_reqs: int, head_hidden: torch.Tensor
+    ) -> None:
+        """The probabilistic loop of ``_sample_sequential`` with one fused
+        sampling kernel pair per position after the unchanged bias GEMM.
+
+        It caches the same logits (base + bias, rounded once to the cache dtype
+        like the eager loop's add, which the screened Gumbel kernel fuses) and
+        draws each token from softmax(cached logits / T) by inverse CDF, keyed
+        by seed, draft step and position, instead of by Gumbel-max: the same
+        distribution, other draws. Greedy rows take the eager argmax. The base
+        logits stay in (req, step) row order: the sampling kernel reads each
+        step through strides, so the eager loop's step-major layout buys
+        nothing here.
+        """
+        sampler = self._fused_sampler
+        assert sampler is not None and self.draft_logits is not None
+        n_spec = self.num_speculative_steps
+        num_sample = num_reqs * n_spec
+        idx_mapping = self.sample_idx_mapping[:num_sample]
+        sample_pos = self.sample_pos[:num_sample]
+        base_logits = self.model.compute_draft_logits(
+            head_hidden[self.sample_indices[:num_sample]]
+        )
+        base_logits = base_logits.view(num_reqs, n_spec, base_logits.shape[-1])
+        markov_embed = sampler.embed_anchor(
+            self.input_buffers.input_ids, self.num_query_per_req, num_reqs
+        )
+        bias_weight = self._markov_bias_weight
+        fuse_bias = bias_weight is not None and num_reqs <= FUSED_MAX_REQS
+        for i in range(n_spec):
+            # The select kernel of position i - 1 left the embeddings of its
+            # tokens in markov_embed.
+            sampler.sample_step(
+                base_logits,
+                bias_weight if fuse_bias else self.model.markov_bias(markov_embed),
+                i,
+                idx_mapping,
+                sample_pos,
+                self.temperature,
+                self.seeds,
+                self.draft_logits.values,
+                self.draft_tokens,
+                fuse_bias=fuse_bias,
+            )
 
     def _sample_markov_chain(
         self,

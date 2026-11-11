@@ -36,6 +36,7 @@ from vllm.model_executor.layers.linear import (
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
 from vllm.model_executor.layers.vocab_parallel_embedding import (
     ParallelLMHead,
+    UnquantizedEmbeddingMethod,
     VocabParallelEmbedding,
 )
 from vllm.model_executor.model_loader.mtp_validation import (
@@ -376,6 +377,27 @@ class DSparkDeepseekV4ForCausalLM(nn.Module):
 
     def markov_bias(self, markov_embed: torch.Tensor) -> torch.Tensor:
         return self.model.markov_head.bias(markov_embed, self.logits_processor)
+
+    def markov_embed_weight(self) -> torch.Tensor:
+        """The table ``markov_embed`` looks up, for fused DSpark sampling."""
+        return self.model.markov_head.markov_w1.weight
+
+    def markov_bias_gemm_weight(self) -> torch.Tensor | None:
+        """The ``[vocab, rank]`` Markov bias projection, when ``markov_bias`` is
+        a plain unquantized product with it (the fused small-batch sampler runs
+        that GEMM itself)."""
+        w2 = self.model.markov_head.markov_w2
+        processor = self.logits_processor
+        if (
+            w2.weight.dtype not in (torch.bfloat16, torch.float16)
+            or not isinstance(w2.quant_method, UnquantizedEmbeddingMethod)
+            or processor.scale != 1.0
+            or processor.soft_cap is not None
+            or processor.logits_as_input
+            or processor.head_dtype not in (None, w2.weight.dtype)
+        ):
+            return None
+        return w2.weight
 
     def compute_confidence(
         self, head_hidden: torch.Tensor, markov_embed: torch.Tensor
