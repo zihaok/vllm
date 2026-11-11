@@ -42,6 +42,7 @@ them like any other kernel.
 
 from __future__ import annotations
 
+import os
 from collections import Counter
 from dataclasses import dataclass
 from functools import cache
@@ -85,6 +86,17 @@ MAX_EXPERTS = 384
 MAX_TOP_K = 8
 TILE = 8
 MAX_ROWS = 8
+# MOSCA LB24 (default off): with VLLM_MOSCA_LB24=1, calls of 9-24 rows (2-4 DSpark
+# requests at TP4) also take these kernels: GEMM1 with a 16 / 24-column B tile, the multi-tile
+# routing record and the 24-row fused front (routed_expert_gemm_n.py); GEMM2 is unchanged.
+# Unset or any other value: the code path above 8 rows is the stock one, untouched.
+MOSCA_LB24 = os.environ.get("VLLM_MOSCA_LB24", "0") == "1"
+MAX_ROWS_N = 24
+
+
+def _gemm1n_variant(rows: int) -> tuple[int, int, int]:
+    """(cta_n, cta_k, AB stages) of GEMM1-N for ``rows`` (the pick that passed a fresh-routing holdout)."""
+    return (16, 128, 11) if rows <= 16 else (24, 128, 11)
 
 
 def max_ctas(rows: int, top_k: int, experts: int) -> int:
@@ -153,6 +165,10 @@ class RoutedExpertGemm:
         _route_kernel(self.device_index)
         _gemm1_kernel(self.device_index)
         _gemm2_kernel(self.device_index)
+        if MOSCA_LB24:
+            _route_n_kernel(self.device_index)
+            for rows in (MAX_ROWS + 1, MAX_ROWS_N):
+                _gemm1n_kernel(self.device_index, *_gemm1n_variant(rows))
         # The modular kernel's input quantization, reused so the activations
         # match its path bit for bit.
         self.prepare_finalize = prepare_finalize
@@ -164,6 +180,8 @@ class RoutedExpertGemm:
     def set_front(self, config: FrontConfig) -> None:
         """Use the fused front with the router's ``config``."""
         _front_kernel(self.device_index, config.bias_vl is not None)
+        if MOSCA_LB24:
+            _front_n_kernel(self.device_index, config.bias_vl is not None)
         self.front_config = config
 
     def accepts(self, x: torch.Tensor, runner: torch.nn.Module) -> bool:
@@ -171,7 +189,7 @@ class RoutedExpertGemm:
         BF16 rows, and the runner's expert weights still the tensors bound here
         (a weight reload replaces them)."""
         return (
-            1 <= x.size(0) <= MAX_ROWS
+            1 <= x.size(0) <= (MAX_ROWS_N if MOSCA_LB24 else MAX_ROWS)
             and x.dtype == torch.bfloat16
             and tuple(x.shape) == (x.size(0), HIDDEN)
             and x.is_contiguous()
@@ -203,7 +221,10 @@ class RoutedExpertGemm:
         ctas = max_ctas(rows, top_k, self.experts)
         permuted = torch.empty((rows, top_k), dtype=torch.int32, device=x.device)
         record = torch.empty(route_words(ctas), dtype=torch.int32, device=x.device)
-        _route_kernel(self.device_index)(
+        route_kernel = (
+            _route_n_kernel if rows > MAX_ROWS else _route_kernel
+        )(self.device_index)
+        route_kernel(
             *(_pointer(cutlass.Int32, t, 4) for t in (ids, permuted, record)),
             Int32(rows),
             Int32(top_k),
@@ -237,7 +258,8 @@ class RoutedExpertGemm:
         if image:
             assert input_ids is not None
             ids = input_ids
-        _front_kernel(self.device_index, image)(
+        front_kernel = _front_n_kernel if rows > MAX_ROWS else _front_kernel
+        front_kernel(self.device_index, image)(
             _pointer(cutlass.Float32, logits, 16),
             _pointer(cutlass.Float32, config.bias, 16),
             _pointer(cutlass.Float32, config.bias_vl if image else config.bias, 16),
@@ -270,7 +292,13 @@ class RoutedExpertGemm:
         h_scales = torch.empty(
             routing.ctas * tile_scale_bytes(PADDED), dtype=torch.uint8, device=device
         )
-        _gemm1_kernel(self.device_index)(
+        rows = routing.x_quant.size(0)
+        gemm1_kernel = (
+            _gemm1n_kernel(self.device_index, *_gemm1n_variant(rows))
+            if rows > MAX_ROWS
+            else _gemm1_kernel(self.device_index)
+        )
+        gemm1_kernel(
             _pointer(cutlass.Float4E2M1FN, self.w13, 32),
             _pointer(cutlass.Float8E8M0FNU, self.w13_scale, 16),
             _pointer(cutlass.Float8E4M3FN, routing.x_quant, 16),
@@ -410,6 +438,76 @@ def _gemm2_kernel(device_index: int):
             Int32(TILE),
             Int32(MAX_EXPERTS),
             Int32(4),
+            Int32(1),
+            make_fake_stream(),
+        )
+
+
+@cache
+def _route_n_kernel(device_index: int):
+    """``RoutedExpertRouteN`` (up to 24 rows, multi-tile experts) compiled for a device."""
+    from .routed_expert_gemm_n import RoutedExpertRouteN
+
+    with torch.accelerator.device_index(device_index):
+        return cute.compile(
+            RoutedExpertRouteN(),
+            _fake(cutlass.Int32, 4),
+            _fake(cutlass.Int32, 4),
+            _fake(cutlass.Int32, 4),
+            Int32(1),
+            Int32(TOP_K),
+            Int32(MAX_EXPERTS),
+            make_fake_stream(),
+        )
+
+
+@cache
+def _front_n_kernel(device_index: int, image: bool):
+    """``RoutedExpertFrontN2`` (up to 24 rows) compiled for a device."""
+    from .routed_expert_gemm_n import RoutedExpertFrontN2
+
+    with torch.accelerator.device_index(device_index):
+        return cute.compile(
+            RoutedExpertFrontN2(image),
+            _fake(cutlass.Float32, 16),
+            _fake(cutlass.Float32, 16),
+            _fake(cutlass.Float32, 16),
+            _fake(cutlass.Int32, 4),
+            Int32(0),
+            Int32(0),
+            Float32(1.0),
+            _fake(cutlass.Uint32, 16),
+            _fake(cutlass.Int32, 16),
+            _fake(cutlass.Float32, 16),
+            _fake(cutlass.Uint8, 16),
+            _fake(cutlass.Uint8, 16),
+            _fake(cutlass.Int32, 16),
+            _fake(cutlass.Int32, 16),
+            Int32(1),
+            make_fake_stream(),
+        )
+
+
+@cache
+def _gemm1n_kernel(device_index: int, cta_n: int, cta_k: int, stages: int):
+    """``RoutedExpertGemm1N`` (a ``cta_n``-column B tile) compiled for a device."""
+    from .routed_expert_gemm_n import RoutedExpertGemm1N
+
+    with torch.accelerator.device_index(device_index):
+        return cute.compile(
+            RoutedExpertGemm1N(HIDDEN, SLICE, PADDED, cta_n, cta_k, stages),
+            _fake(cutlass.Float4E2M1FN, 32),
+            _fake(cutlass.Float8E8M0FNU, 16),
+            _fake(cutlass.Float8E4M3FN, 16),
+            _fake(cutlass.Uint32, 16),
+            _fake(cutlass.Uint16, 16),
+            _fake(cutlass.Uint8, 16),
+            _fake(cutlass.Int32, 16),
+            _fake(cutlass.Float32, 16),
+            Int32(1),
+            Int32(MAX_EXPERTS),
+            Int32(4),
+            Int32(TILE),
             Int32(1),
             make_fake_stream(),
         )

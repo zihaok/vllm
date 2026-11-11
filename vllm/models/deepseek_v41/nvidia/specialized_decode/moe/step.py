@@ -32,7 +32,7 @@ from vllm.model_executor.layers.fused_moe.runner.shared_experts import (
     SharedExpertsOrder,
 )
 
-from .routed_expert_gemm import RoutedExpertGemm, front_applies
+from .routed_expert_gemm import MAX_ROWS_N, MOSCA_LB24, RoutedExpertGemm, front_applies
 
 if TYPE_CHECKING:
     from ...model import DeepseekV4MoE
@@ -88,7 +88,9 @@ class MoEStep:
         if not self.deferrable:
             return self.ffn(x, input_ids, None)
         gemm = self.gemm
-        if step.low_batch and gemm is not None and gemm.accepts(x, self.runner):
+        # MOSCA LB24 (default off): 9-24 rows also take the low-batch GEMMs.
+        low_batch = step.low_batch or (MOSCA_LB24 and x.shape[0] <= MAX_ROWS_N)
+        if low_batch and gemm is not None and gemm.accepts(x, self.runner):
             routed, shared_output = self._forward_low_batch(gemm, x, input_ids)
             return MoEOutput(routed=routed, shared_output=shared_output)
         # The runner's custom op returns tensors only, so run its body directly.
