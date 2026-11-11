@@ -71,6 +71,9 @@ class DecoderReplayLayers:
         # Set by the model state with replay graphs: PIECEWISE model graphs of
         # this many tokens or more break out to the replay batch.
         self.trim_threshold: int | None = None
+        # Set by the model to apply its output head (collapse + norm) to the
+        # layers' outputs here, on the replay rows only.
+        self.finalize: Callable[..., tuple[torch.Tensor, ...]] | None = None
         self._break_outputs: list[torch.Tensor] | None = None
 
     def __call__(
@@ -116,7 +119,8 @@ class DecoderReplayLayers:
     ) -> tuple[torch.Tensor, ...]:
         replay_batch = self.replay_batch
         if replay_batch is None:
-            return self.run_layers(hidden_states, *states)
+            outputs = self.run_layers(hidden_states, *states)
+            return outputs if self.finalize is None else self.finalize(*outputs)
         # Replay batch steps hold more than `window` tokens: no deferred MoE finalize.
         assert isinstance(hidden_states, torch.Tensor)
         rows = replay_batch.rows
@@ -137,11 +141,14 @@ class DecoderReplayLayers:
                         for t in row_inputs
                     ]
                 row_outputs = self.run_layers(*row_inputs)
+        # Drop the PCP padding rows before the finalize and the scatter.
+        num_rows = rows.numel()
+        row_outputs = tuple(out[:num_rows] for out in row_outputs)
+        if self.finalize is not None:
+            row_outputs = self.finalize(*row_outputs)
         # The trimmed rows' outputs stay zero; nothing reads them.
         num_tokens = hidden_states.shape[0]
         return tuple(
-            index_copy_rows_(
-                out.new_zeros((num_tokens, *out.shape[1:])), rows, out[: rows.numel()]
-            )
+            index_copy_rows_(out.new_zeros((num_tokens, *out.shape[1:])), rows, out)
             for out in row_outputs
         )
