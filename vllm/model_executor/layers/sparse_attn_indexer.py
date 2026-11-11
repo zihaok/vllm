@@ -52,6 +52,7 @@ from vllm.triton_utils import tl, triton
 from vllm.utils.deep_gemm import (
     fp8_fp4_mqa_logits,
     fp8_fp4_paged_mqa_logits,
+    get_mqa_logits_metadata,
     has_deep_gemm,
     mqa_logits_mx_inputs,
     mqa_logits_use_mx_scales,
@@ -66,7 +67,9 @@ from vllm.utils.torch_utils import (
 )
 from vllm.v1.attention.backends.mla.indexer import (
     DeepseekV32IndexerMetadata,
+    DeepseekV32IndexerPrefillChunkMetadata,
     dense_logits_rows,
+    prefill_logits_elem_size,
     tp_prefill_row_sharding_supported,
 )
 from vllm.v1.attention.ops.common import pack_seq_triton, unpack_seq_triton
@@ -447,6 +450,35 @@ def _reserve_row_shard_exchange_transient(
     )
 
 
+def _chunk_row_ends_and_schedule(
+    chunk: DeepseekV32IndexerPrefillChunkMetadata,
+    cu_seqlen_ks: torch.Tensor,
+    cu_seqlen_ke: torch.Tensor,
+    num_kv_tokens: int,
+    num_heads: int,
+) -> tuple[torch.Tensor, torch.Tensor | None]:
+    """Per-row KV lengths and the DeepGEMM logits schedule of a prefill chunk.
+
+    Cached on the chunk, so the indexer layers sharing this step's metadata
+    build them once; a row-sharded (narrowed) or row-split chunk builds its
+    own. The key holds the capture flag, so a captured layer never reads an
+    eager run's.
+    """
+
+    def build() -> tuple[torch.Tensor, torch.Tensor | None]:
+        meta = get_mqa_logits_metadata(
+            cu_seqlen_ks, cu_seqlen_ke, num_kv_tokens, num_heads
+        )
+        return cu_seqlen_ke - cu_seqlen_ks, meta
+
+    if cu_seqlen_ks is not chunk.cu_seqlen_ks:
+        return build()
+    key = (torch.cuda.is_current_stream_capturing(), num_kv_tokens, num_heads)
+    if key not in chunk.derived:
+        chunk.derived[key] = build()
+    return chunk.derived[key]
+
+
 @eager_break_during_capture
 def sparse_attn_indexer(
     hidden_states: torch.Tensor,
@@ -552,9 +584,12 @@ def sparse_attn_indexer(
         copy_bytes = 0 if logits_dtype == torch.float32 else torch.float32.itemsize
         decode_copy_bytes = copy_bytes if fp32_decode_logits else 0
         prefill_budget = envs.VLLM_SPARSE_INDEXER_MAX_LOGITS_MB * 1024 * 1024
+        # Chunks are planned at prefill_logits_elem_size bytes per logit (2
+        # when DeepSelect ranks the bf16 logits in place); the FP32 copy is
+        # still counted for a chunk DeepSelect does not take.
         max_logits_bytes = max(
             prefill_budget
-            // torch.float32.itemsize
+            // prefill_logits_elem_size(topk_backend, dcp_world_size)
             * (logits_dtype.itemsize + copy_bytes),
             max_decode_tokens
             * round_up(max_model_len, row_align)
@@ -706,6 +741,11 @@ def sparse_attn_indexer(
             if candidate_blocks is not None
             else PrefillRowShard.from_metadata(prefill_metadata, num_decode_tokens)
         )
+        # Once per layer rather than per chunk: bf16 weights / unit Q scales.
+        mx_q_scale, mx_weights = mqa_logits_mx_inputs(q_quant, q_scale, weights)
+        # Bytes per logit the chunk planner budgeted (2 when DeepSelect ranks
+        # the bf16 logits in place), so planned chunks are not split again.
+        logits_elem_size = prefill_logits_elem_size(topk_backend, dcp_world_size)
         for chunk in prefill_metadata.chunks:
             cu_seqlen_ks = chunk.cu_seqlen_ks
             cu_seqlen_ke = chunk.cu_seqlen_ke
@@ -755,7 +795,9 @@ def sparse_attn_indexer(
             # cu_seqlen_ks[i]. None means every row starts at column zero.
             row_starts: torch.Tensor | None = None
             # Rows per dense logits call under the logits budget.
-            dense_rows = dense_logits_rows(chunk.max_seqlen_k)
+            dense_rows = dense_logits_rows(
+                chunk.max_seqlen_k, elem_size=logits_elem_size
+            )
             use_deep_select = False
             if chunk.local_total_seq_lens == 0 or q_slice.shape[0] == 0:
                 logits = q_slice.new_empty((q_slice.shape[0], 0), dtype=torch.float32)
@@ -813,19 +855,31 @@ def sparse_attn_indexer(
                         row_starts = cu_seqlen_ks[rows]
                         row_ends = cu_seqlen_ke[rows]
                     else:
-                        q_scale_rows, chunk_weights = mqa_logits_mx_inputs(
-                            q_slice_cast[rows],
-                            q_scale_slice[rows] if q_scale_slice is not None else None,
-                            weights[tokens],
+                        # A one-call chunk passes the chunk's own row bounds,
+                        # so the layers sharing this step's metadata reuse its
+                        # row ends and DeepGEMM schedule (_chunk_row_ends_and_
+                        # schedule); a row-split call builds its own.
+                        whole = rows.start == 0 and rows.stop == q_slice.shape[0]
+                        row_ks = cu_seqlen_ks if whole else cu_seqlen_ks[rows]
+                        row_ke = cu_seqlen_ke if whole else cu_seqlen_ke[rows]
+                        row_ends, schedule_meta = _chunk_row_ends_and_schedule(
+                            chunk,
+                            row_ks,
+                            row_ke,
+                            k_quant_cast.shape[0],
+                            q_slice_cast.shape[1],
                         )
-                        row_ends = cu_seqlen_ke[rows] - cu_seqlen_ks[rows]
                         logits = fp8_fp4_mqa_logits(
-                            (q_slice_cast[rows], q_scale_rows),
+                            (
+                                q_slice_cast[rows],
+                                mx_q_scale[tokens] if mx_q_scale is not None else None,
+                            ),
                             (k_quant_cast, k_scale_cast),
-                            chunk_weights,
-                            cu_seqlen_ks[rows],
-                            cu_seqlen_ke[rows],
+                            mx_weights[tokens],
+                            row_ks,
+                            row_ke,
                             chunk.max_seqlen_k,
+                            schedule_meta,
                         )
                         # DeepSelect ranks the bf16 logits in place of their exact
                         # fp32 copy; fp32 logits keep the per-row top-k.

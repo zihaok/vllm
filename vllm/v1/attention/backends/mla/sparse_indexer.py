@@ -150,9 +150,10 @@ class DeepseekV41SparseIndexerMetadataBuilder(DeepseekV32IndexerMetadataBuilder)
         num_sparse_cols = self.num_sparse_blocks * self.sparse_block_kv
         check_deep_select_layout(num_sparse_cols, topk_tokens)
         # Sparse logits are bf16 [rows, num_sparse_cols]; make the prefill
-        # chunker (which budgets fp32 [rows, seq_len]) size chunks as if every
-        # row were this wide.
-        self.min_split_seq_len = (num_sparse_cols * 2 + 3) // 4
+        # chunker (which budgets [rows, seq_len] at logits_elem_size bytes)
+        # size chunks as if every row were this wide.
+        elem = self.logits_elem_size
+        self.min_split_seq_len = (num_sparse_cols * 2 + elem - 1) // elem
 
         # Rows are indexed by batch token (decode rows first, then prefill
         # chunks by token range), like ``arange_buffer``.

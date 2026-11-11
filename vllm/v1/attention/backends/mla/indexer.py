@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any
 
 import numpy as np
@@ -30,6 +30,7 @@ from vllm.utils.deep_gemm import (
     get_paged_mqa_logits_metadata,
     get_paged_mqa_page_sizes,
     has_deep_gemm,
+    mqa_logits_use_mx_scales,
     native_next_n_supported,
 )
 from vllm.utils.math_utils import round_down
@@ -479,6 +480,11 @@ class DeepseekV32IndexerPrefillChunkMetadata:
     max_local_total_seq_lens: int = 0
 
     pcp_deinterleave_idx: torch.Tensor | None = None
+    # Tensors derived from this chunk by the first indexer layer that scores it
+    # and reused by the next ones (``row_ends``, the DeepGEMM logits schedule).
+    derived: dict[tuple, tuple[torch.Tensor, torch.Tensor | None]] = field(
+        default_factory=dict
+    )
 
 
 class BuildPrefillChunkMetadataKernel(
@@ -932,9 +938,25 @@ def get_max_prefill_buffer_size(vllm_config: VllmConfig):
     return max_model_len * (576 * 2 // 132) * factor
 
 
-def dense_logits_rows(max_seqlen_k: int, max_logits_bytes: int | None = None) -> int:
-    """Query rows per dense MQA-logits call whose fp32 [rows, max_seqlen_k]
-    logits fit max_logits_bytes (default: VLLM_SPARSE_INDEXER_MAX_LOGITS_MB).
+def prefill_logits_elem_size(topk_backend: str, dcp_world_size: int) -> int:
+    """Bytes per prefill MQA logit that the prefill chunk planner and the
+    indexer budget: SM100's bf16 logits, which DeepSelect ranks in place
+    without an fp32 copy, take 2; otherwise the fp32 copy, 4."""
+    return (
+        2
+        if mqa_logits_use_mx_scales()
+        and dcp_world_size == 1
+        and topk_backend == "deep_select"
+        else 4
+    )
+
+
+def dense_logits_rows(
+    max_seqlen_k: int, max_logits_bytes: int | None = None, elem_size: int = 4
+) -> int:
+    """Query rows per dense MQA-logits call whose [rows, max_seqlen_k] logits
+    of ``elem_size`` bytes (4: the fp32 copy; 2: bf16 ranked by DeepSelect)
+    fit max_logits_bytes (default: VLLM_SPARSE_INDEXER_MAX_LOGITS_MB).
 
     The prefill chunk planner sub-chunks requests with it; the indexers split
     the rows of chunks planned for fused_mqa_topk (not bounded by the budget)
@@ -942,7 +964,7 @@ def dense_logits_rows(max_seqlen_k: int, max_logits_bytes: int | None = None) ->
     """
     if max_logits_bytes is None:
         max_logits_bytes = envs.VLLM_SPARSE_INDEXER_MAX_LOGITS_MB * 1024 * 1024
-    return max(1, max_logits_bytes // (4 * max(1, max_seqlen_k)))
+    return max(1, max_logits_bytes // (elem_size * max(1, max_seqlen_k)))
 
 
 def _supports_varlen_paged_mqa_logits() -> bool:
@@ -1065,6 +1087,12 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
             // (getattr(cfg, "index_kpool", None) or 1),
             fp4_cache=self.indexer_uses_fp4,
             full_context=self.dcp_world_size == 1,
+        )
+        # Bytes per prefill logit the chunk planner budgets (2 when DeepSelect
+        # ranks SM100's bf16 logits in place): fewer, larger prefill chunks.
+        self.logits_elem_size = prefill_logits_elem_size(
+            self.vllm_config.kernel_config.sparse_indexer_topk_backend,
+            self.dcp_world_size,
         )
 
         next_n = self.num_speculative_tokens + 1
@@ -1409,11 +1437,12 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
         max_logits_bytes: int,
         request_offset: int = 0,
         fused_mqa_topk_eligible: bool = False,
+        logits_elem_size: int = 4,
     ) -> list[tuple[slice, slice]]:
         """Split this step's prefill requests into chunks, respecting:
         - N constraint: total_seq_lens <= workspace_size (existing O(N)
           workspace)
-        - Logits constraint: M * N * 4 <= max_logits_bytes
+        - Logits constraint: M * N * logits_elem_size <= max_logits_bytes
 
         When a single request-level chunk still exceeds the logits budget,
         sub-chunks on the query dimension (M) to bound peak memory.
@@ -1429,7 +1458,7 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
         """
         chunks: list[tuple[slice, slice]] = []
         n = len(compressed_seq_lens_cpu)
-        max_logits_elems = max_logits_bytes // 4
+        max_logits_elems = max_logits_bytes // logits_elem_size
         end = 0
 
         while end < n:
@@ -1466,7 +1495,7 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
 
             req_slice = slice(start + request_offset, end + request_offset)
             max_q = (
-                dense_logits_rows(chunk_n, max_logits_bytes)
+                dense_logits_rows(chunk_n, max_logits_bytes, logits_elem_size)
                 if chunk_n > 0
                 else max(1, chunk_m)
             )
@@ -1608,6 +1637,7 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
                     max_logits_bytes,
                     request_offset=num_decodes,
                     fused_mqa_topk_eligible=self.fused_mqa_topk_eligible,
+                    logits_elem_size=self.logits_elem_size,
                 )
 
             chunks = []
