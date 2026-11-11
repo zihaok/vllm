@@ -41,6 +41,7 @@ from .aux_projections import aux_projection_gemm, aux_projection_gemm_accepts
 from .indexer import CandidateOverlap, decode_rows, rope_quant_q
 from .indexer_k_store import indexer_k_norm_rope_store_fp32
 from .mxfp8 import low_latency_mm, mxfp8_eligible
+from .mxfp8_n import accepts as lln16_accepts, lln16_mm, precompile as lln16_precompile
 from .sparse_mla import SparseIndexTables, SparseMlaDecode
 
 if TYPE_CHECKING:
@@ -94,6 +95,10 @@ class AttentionStep:
         self.source = source
         self.consumer = consumer
         self.wqa_mxfp8 = mxfp8_eligible(attn.fused_wqa_wkv)
+        # MOSCA LLN16 (VLLM_MOSCA_LLN16, default off): 9-24 rows of fused_wqa_wkv
+        # on the low-latency GEMM with a 16 / 24-column token tile (mxfp8_n).
+        if self.wqa_mxfp8:
+            lln16_precompile(attn.fused_wqa_wkv.weight.device.index)
         self.wq_b_mxfp8 = mxfp8_eligible(attn.wq_b)
         self.wo_b_mxfp8 = mxfp8_eligible(attn.wo_b)
         self.aux_gemm = aux_projection_gemm_accepts(side_weights(attn))
@@ -177,6 +182,8 @@ class AttentionStep:
             qr_kv = None
             if step.low_batch and self.wqa_mxfp8:
                 qr_kv = low_latency_mm(attn.fused_wqa_wkv, quant)
+            elif self.wqa_mxfp8 and lln16_accepts(quant.data.shape[0]):
+                qr_kv = lln16_mm(attn.fused_wqa_wkv, quant)
             if qr_kv is None:
                 qr_kv = attn.fused_wqa_wkv(quant)[0]
         return qr_kv, results[0], results[1]
