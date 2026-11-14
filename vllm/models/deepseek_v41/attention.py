@@ -3,6 +3,8 @@
 """DeepseekV4 MLA Attention Layer"""
 
 import math
+import os
+import types
 from abc import ABC, abstractmethod
 from collections.abc import Callable
 from functools import cached_property
@@ -85,6 +87,58 @@ from vllm.v1.kv_cache_interface import (
 )
 
 logger = init_logger(__name__)
+
+# MOSCA GEMM-8 (flag default off). wq_b and the indexer's wq_b read the same quantized qr, so in the index-source
+# layers they can run as ONE MXFP8 GEMM over the concatenated weight [K, n_q + n_idx], with both consumers reading
+# column views of its output. VLLM_MOSCA_GEMM8 = "0" (off, the served path) | "fi" (FlashInfer CuTe-DSL MXFP8, the
+# served kernel class) | "cublaslt" (torch._scaled_mm, MXFP8 with e8m0 F8_128x4 scales). The concat is built once,
+# eagerly (never while a CUDA graph is captured), from the processed weights, and both layers are re-pointed at
+# views of its storage, so no weight memory is added. Layers whose kernels are not the FlashInfer CuTe-DSL MXFP8
+# class, whose n_q is not a multiple of 128 (the F8_128x4 scale tile), or whose q is head-padded keep the served path.
+_MOSCA_GEMM8 = os.environ.get("VLLM_MOSCA_GEMM8", "0").strip().lower()
+# MOSCA GEMM-8 T key (default 0 = the concat at every M): below VLLM_MOSCA_GEMM8_MIN_M rows the layer runs
+# the served pair, whose bits the concat does not reproduce at M 6-30 on VR200 (WarpSplitK at M 6, CuteDSLMxfp8Gemm for the
+# indexer at M 12-30); the concat is bitwise to the pair from M 36 up. Static per captured graph size.
+_MOSCA_GEMM8_MIN_M = int(os.environ.get("VLLM_MOSCA_GEMM8_MIN_M", "0").strip() or 0)
+
+
+def _mosca_fi_tuning() -> bool:
+    """True inside FlashInfer's autotune pass (kernel_warmup): the served pair must be tuned there too, because the warmup
+    dummy run at large M takes the concat and an untuned pair would run FlashInfer's fallback tactic below the key."""
+    try:
+        from flashinfer.autotuner import AutoTuner
+
+        return bool(AutoTuner.get().is_tuning_mode)
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def _mosca_gemm8_build(wq_b: nn.Module, idx_wq_b: nn.Module):
+    from vllm.model_executor.kernels.linear.mxfp8.flashinfer import (
+        FlashInferCutedslMxfp8LinearKernel,
+    )
+
+    kq = getattr(wq_b.quant_method, "kernel", None)
+    ki = getattr(idx_wq_b.quant_method, "kernel", None)
+    if not (
+        isinstance(kq, FlashInferCutedslMxfp8LinearKernel)
+        and isinstance(ki, FlashInferCutedslMxfp8LinearKernel)
+    ):
+        return None
+    wq, wi = wq_b.weight, idx_wq_b.weight  # [K, N] column-major views (FI operand B)
+    k_q, n_q = wq.shape
+    k_i, n_i = wi.shape
+    if k_q != k_i or n_q % 128 or wq.stride() != (1, k_q) or wi.stride() != (1, k_i):
+        return None
+    rows = torch.cat([wq.t(), wi.t()], dim=0)  # [n_q + n_i, K] row-major
+    scale = torch.cat([wq_b.weight_scale.reshape(-1), idx_wq_b.weight_scale.reshape(-1)])
+    n_sq = wq_b.weight_scale.numel()
+    # Re-point both layers at the concat storage: the bytes are the same, the memory is shared.
+    wq_b.weight.data = rows[:n_q].t()
+    idx_wq_b.weight.data = rows[n_q:].t()
+    wq_b.weight_scale.data = scale[:n_sq]
+    idx_wq_b.weight_scale.data = scale[n_sq:]
+    return rows.t(), scale, n_q, n_i, kq
 
 # From this many tokens, a layer with shard_fused_wqa_wkv set projects one token
 # shard per TP rank and all-gathers the result.
@@ -990,7 +1044,55 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
     ) -> torch.Tensor:
         """Project normalized Q, bypassing quantization when already fused."""
         assert qr_scale is None, "ROCm-only path"
-        return self.wq_b(qr)
+        g8 = self._mosca_gemm8() if _MOSCA_GEMM8 in ("fi", "cublaslt") else None
+        if g8 is None or not isinstance(qr, QuantizedActivation):
+            return self.wq_b(qr)
+        if _MOSCA_GEMM8_MIN_M > 0:
+            if qr.data.shape[0] < _MOSCA_GEMM8_MIN_M:
+                return self.wq_b(qr)  # below the key: the served pair (the indexer runs its own wq_b)
+            if _mosca_fi_tuning():
+                self.wq_b(qr)  # tune the served pair's FlashInfer op for every bucket (the indexer's is tuned by autotune_indexer_wq_b)
+        w, scale, n_q, _, kernel = g8
+        if _MOSCA_GEMM8 == "cublaslt":
+            e8 = torch.float8_e8m0fnu
+            y = torch._scaled_mm(
+                qr.data,
+                w,
+                scale_a=qr.scale.reshape(-1).view(e8),
+                scale_b=scale.view(e8),
+                out_dtype=qr.orig_dtype,
+            )
+        else:
+            y = kernel.apply_weights(
+                types.SimpleNamespace(weight=w, weight_scale=scale, params_dtype=qr.orig_dtype),
+                qr,
+            )
+        # The indexer runs next on this stream and reads the same qr: hand it its columns.
+        self.indexer._mosca_gemm8_q = (qr, y[:, n_q:])
+        return y[:, :n_q]
+
+    def _mosca_gemm8(self):
+        """The GEMM-8 concat for this layer, built once outside graph capture; None keeps the served path."""
+        state = self.__dict__.get("_mosca_gemm8_state")
+        if state is not None:
+            return state or None
+        if torch.cuda.is_current_stream_capturing():
+            return None
+        state = False
+        if (
+            self.indexer is not None
+            and self.accepts_unnormed_unroped_query
+            and self.n_local_heads == self.padded_heads
+        ):
+            try:
+                state = _mosca_gemm8_build(self.wq_b, self.indexer.wq_b) or False
+            except Exception as e:  # typed in the log, the served path stays
+                logger.warning_once("GEMM-8 not built (%s); keeping two GEMMs.", e)
+                state = False
+        # MOSCA GEMM-8 census: one line per layer on the first call (expected built=True in every index-source layer).
+        logger.info("MOSCA_GEMM8_CENSUS built=%s min_m=%d mode=%s", bool(state), _MOSCA_GEMM8_MIN_M, _MOSCA_GEMM8)
+        self._mosca_gemm8_state = state
+        return state or None
 
     def _run_parallel_input_projections(
         self, hidden_states: torch.Tensor
@@ -1168,8 +1270,15 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
                 and self.n_local_heads == self.padded_heads
                 else self.padded_heads
             )
+            # GEMM-8 hands a column view of the concat output; the op checks q_in.is_contiguous() although with
+            # pad_to == 0 it leaves Q untouched, so it gets a contiguous alias over the same storage.
+            q_arg = (
+                q.as_strided(q.shape, (q.shape[1] * q.shape[2], q.shape[2], 1))
+                if pad_to == 0 and not q.is_contiguous()
+                else q
+            )
             q_padded = torch.ops._C.fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert(
-                q,
+                q_arg,
                 kv,
                 swa_kv_cache_2d,
                 slot_mapping,
@@ -1632,6 +1741,9 @@ class DeepseekV4Indexer(nn.Module):
     ) -> torch.Tensor:
         """Project normalized Q with the main attention's shared quantization."""
         assert qr_scale is None, "ROCm-only path"
+        handed = self.__dict__.pop("_mosca_gemm8_q", None)
+        if handed is not None and handed[0] is qr:
+            return handed[1]  # GEMM-8: the columns of the shared concat GEMM
         # ReplicatedLinear returns (output, bias); bias is None.
         q, _ = self.wq_b(qr)
         return q
