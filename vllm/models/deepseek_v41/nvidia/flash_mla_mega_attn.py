@@ -15,6 +15,7 @@ and decode segments write disjoint token ranges of one output buffer pair, so
 a single ``wo_a`` einsum covers the whole step.
 """
 
+import os
 from dataclasses import replace
 from functools import cached_property
 from typing import TYPE_CHECKING, cast
@@ -52,6 +53,43 @@ from vllm.v1.worker.workspace import current_workspace_manager
 
 if TYPE_CHECKING:
     from vllm.v1.attention.backends.mla.sparse_swa import DeepseekSparseSWAMetadata
+
+# MOSCA IDX-FOLD (switch VLLM_MOSCA_IDX_FOLD, default off). The decode index slot ids and lengths of one index
+# group (the compressed layers from an index source to the next) are equal: the same shared topk_indices_buffer, the
+# kv source's block table and page, the per-batch token_to_req_indices / is_valid_token. So
+#  - consumers reuse the index source's (indices, lens) (one translation per index group, as the
+#    specialized decode's SparseIndexTables do), and
+#  - the index source reuses what its producer wrote in this forward (the sparse indexer's folded remap,
+#    mosca_idx_fold.remap_translate), else translates itself (dense sources: the top-k is DeepSelect).
+# Every table entry carries a signature of the inputs; a miss translates, so the switch can only skip equal work.
+_MOSCA_IDX_FOLD = os.environ.get("VLLM_MOSCA_IDX_FOLD", "0") == "1"
+_MOSCA_IDX_FOLD_VERIFY = int(os.environ.get("VLLM_MOSCA_IDX_FOLD_VERIFY", "0")) > 0
+# (index_source_layer_id, kv_source_layer_id, compress_ratio) -> (signature, indices, lens)
+_MOSCA_XLATE_TABLE: dict[tuple, tuple] = {}
+_MOSCA_PRODUCED: dict[tuple, tuple] = {}
+
+
+def mosca_xlate_key(layer) -> tuple | None:
+    if getattr(layer, "index_source_layer_id", None) is None:
+        return None
+    return (layer.index_source_layer_id, layer.kv_source_layer_id, layer.compress_ratio)
+
+
+def mosca_xlate_signature(topk_indices_buffer, num_decode_tokens, block_table, page) -> tuple:
+    return (
+        topk_indices_buffer.data_ptr(),
+        tuple(topk_indices_buffer.stride()),
+        int(num_decode_tokens),
+        block_table.data_ptr(),
+        tuple(block_table.shape),
+        tuple(block_table.stride()),
+        int(page),
+    )
+
+
+def mosca_publish_produced(key, sig, indices, lens) -> None:
+    """Called by the folded producer of an index source (same forward, before the source's attention)."""
+    _MOSCA_PRODUCED[key] = (sig, indices, lens)
 
 _HEAD_DIM_V = 512
 _ROPE_DIM = 64
@@ -350,14 +388,86 @@ class DeepseekV4MegaAttnAttention(DeepseekV4FlashMLAAttention):
         assert swa_metadata.is_valid_token is not None
         assert self.topk_indices_buffer is not None
         num_decode_tokens = swa_metadata.num_decode_tokens
+        block_table = flashmla_metadata.block_table[: swa_metadata.num_decodes]
+        page = flashmla_metadata.block_size // self.compress_ratio
+        key = mosca_xlate_key(self) if _MOSCA_IDX_FOLD else None
+        if key is not None:
+            sig = mosca_xlate_signature(self.topk_indices_buffer, num_decode_tokens, block_table, page)
+            if getattr(self, "is_index_source", False):
+                hit = _MOSCA_PRODUCED.pop(key, None)
+            else:
+                hit = _MOSCA_XLATE_TABLE.get(key)
+            if hit is not None and hit[0] == sig:
+                from vllm.models.deepseek_v41.common.ops import mosca_idx_fold_serve as S
+
+                if getattr(self, "is_index_source", False):
+                    _MOSCA_XLATE_TABLE[key] = hit
+                    S.census_add(num_decode_tokens, "prod", id(self))
+                else:
+                    S.census_add(num_decode_tokens, "x1", id(self))
+                if _MOSCA_IDX_FOLD_VERIFY:
+                    # graph-safe: compared on the GPU, counted in device counters
+                    S.verify_xlate(
+                        hit[1],
+                        hit[2],
+                        lambda: compute_global_topk_indices_and_lens(
+                            self.topk_indices_buffer[:num_decode_tokens],
+                            swa_metadata.token_to_req_indices,
+                            block_table,
+                            page,
+                            swa_metadata.is_valid_token[:num_decode_tokens],
+                        ),
+                    )
+                return self._compressed_kv_cache().unsqueeze(-2), hit[1], hit[2]
         indices, lens = compute_global_topk_indices_and_lens(
             self.topk_indices_buffer[:num_decode_tokens],
             swa_metadata.token_to_req_indices,
-            flashmla_metadata.block_table[: swa_metadata.num_decodes],
-            flashmla_metadata.block_size // self.compress_ratio,
+            block_table,
+            page,
             swa_metadata.is_valid_token[:num_decode_tokens],
         )
+        if key is not None:
+            from vllm.models.deepseek_v41.common.ops import mosca_idx_fold_serve as S
+
+            S.census_add(num_decode_tokens, "tr", id(self))
+            if getattr(self, "is_index_source", False):
+                _MOSCA_XLATE_TABLE[key] = (sig, indices, lens)
         return self._compressed_kv_cache().unsqueeze(-2), indices, lens
+
+    def mosca_producer_ctx(self) -> dict | None:
+        """MOSCA IDX-FOLD: the translation context an index source hands its
+        sparse indexer (decode-only steps), so the remap also writes the slot ids
+        and lengths and publishes them for this layer."""
+        if not (_MOSCA_IDX_FOLD and self.compress_ratio > 0):
+            return None
+        if not getattr(self, "is_index_source", False):
+            return None
+        attn_metadata = get_forward_context().attn_metadata
+        if not isinstance(attn_metadata, dict) or self.compressed_cache_prefix is None:
+            return None
+        flashmla_metadata = attn_metadata.get(self.compressed_cache_prefix)
+        swa_metadata = attn_metadata.get(self.swa_cache_layer.prefix)
+        if flashmla_metadata is None or swa_metadata is None:
+            return None
+        if swa_metadata.num_prefills > 0 or swa_metadata.num_decodes == 0:
+            return None
+        if swa_metadata.is_valid_token is None or self.topk_indices_buffer is None:
+            return None
+        num_decode_tokens = swa_metadata.num_decode_tokens
+        block_table = flashmla_metadata.block_table[: swa_metadata.num_decodes]
+        page = flashmla_metadata.block_size // self.compress_ratio
+        key = mosca_xlate_key(self)
+        sig = mosca_xlate_signature(self.topk_indices_buffer, num_decode_tokens, block_table, page)
+        return dict(
+            topk_buffer=self.topk_indices_buffer,
+            token_to_req=swa_metadata.token_to_req_indices,
+            is_valid=swa_metadata.is_valid_token[:num_decode_tokens],
+            block_table=block_table,
+            page=page,
+            num_decode_tokens=num_decode_tokens,
+            key=key,
+            publish=lambda indices, lens: mosca_publish_produced(key, sig, indices, lens),
+        )
 
     def _forward_decode_mega(
         self,

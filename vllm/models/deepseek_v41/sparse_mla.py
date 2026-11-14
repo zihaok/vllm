@@ -76,6 +76,13 @@ class DeepseekV41SparseSWAMetadataBuilder(DeepseekSparseSWAMetadataBuilder):
             deepseek_v41_layer_type(int(ratio)) for ratio in compress_ratios
         }
 
+    def mosca_fold_builds(self, common_attn_metadata, replay_start=None, **kw):
+        if self.pcp_size > 1:
+            return None
+        return super().mosca_fold_builds(
+            common_attn_metadata, replay_start=replay_start, **kw
+        )
+
     def build(
         self,
         common_prefix_len: int,
@@ -211,6 +218,29 @@ class DeepseekV4SparseMLAMetadataBuilder(
                 max_num_batched_tokens, dtype=torch.int64, device=device
             )
 
+    def mosca_fold_builds(self, common_attn_metadata, **_):
+        """MOSCA IDX-FOLD: the ratio-2 build's clamp + compressed slot
+        mapping, as data for the step's one fold launch. The request map is
+        computed here in the served order (build does it first)."""
+        cm = common_attn_metadata
+        cm.token_to_req_indices(self.req_id_per_token_buffer)
+        if self.pcp_size > 1 or self.compress_ratio <= 1 or cm.num_actual_tokens == 0:
+            return None
+        self._mosca_folded = True
+        return [
+            (
+                "csm",
+                dict(
+                    block_table=cm.block_table_tensor,
+                    slot_mapping=cm.slot_mapping,
+                    out=self.compressed_slot_mapping_buffer,
+                    block_size=int(self.kv_cache_spec.num_states),
+                    ratio=self.compress_ratio,
+                    clamp_rows=1,
+                ),
+            )
+        ]
+
     def build(
         self,
         common_prefix_len: int,
@@ -221,7 +251,12 @@ class DeepseekV4SparseMLAMetadataBuilder(
         req_id_per_token = cm.token_to_req_indices(self.req_id_per_token_buffer)
 
         slot_mapping = cm.slot_mapping
-        if self.compress_ratio > 1:
+        mosca_folded = getattr(self, "_mosca_folded", False)
+        self._mosca_folded = False
+        if self.compress_ratio > 1 and mosca_folded:
+            # MOSCA IDX-FOLD: clamped and written by the step's fold launch.
+            slot_mapping = self.compressed_slot_mapping_buffer[: cm.num_actual_tokens]
+        elif self.compress_ratio > 1:
             local_slots = slot_mapping
             if self.pcp_size > 1:
                 local_slots = slot_mapping.chunk(self.pcp_size)[self.pcp_rank]

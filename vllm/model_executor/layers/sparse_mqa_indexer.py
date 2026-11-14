@@ -158,7 +158,22 @@ class SparseMQAIndexer(nn.Module):
         kv_cache = self.k_cache.kv_cache
         topk_tokens = self.topk_tokens
         topk_indices_buffer = self.topk_indices_buffer
-        topk_indices_buffer[: hidden_states.shape[0]] = -1
+        # MOSCA IDX-FOLD: an armed index source on a decode-only step takes
+        # the -1 fill, the remap and the translation in one kernel.
+        mosca_fold = None
+        if metadata.num_prefills == 0 and metadata.num_decodes > 0:
+            from vllm.models.deepseek_v41.common.ops import mosca_idx_fold_serve
+
+            ctx = mosca_idx_fold_serve.ARMED
+            if (
+                ctx is not None
+                and ctx["topk_buffer"].data_ptr() == topk_indices_buffer.data_ptr()
+                and metadata.sparse_decode is not None
+                and metadata.sparse_decode.row_ke.shape[0] > 0
+            ):
+                mosca_fold = dict(ctx, n_fill=hidden_states.shape[0])
+        if mosca_fold is None:
+            topk_indices_buffer[: hidden_states.shape[0]] = -1
         sparse_block_kv = metadata.sparse_block_kv
 
         if metadata.num_prefills > 0:
@@ -218,5 +233,6 @@ class SparseMQAIndexer(nn.Module):
                     end=decode_rows.end,
                     col_indices=decode_rows.col_indices,
                     kernel_metadata=decode_rows.kernel_metadata,
+                    mosca_fold=mosca_fold,
                 )
         return topk_indices_buffer

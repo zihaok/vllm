@@ -420,6 +420,7 @@ def sparse_mqa_logits_paged_decode(
     end: torch.Tensor,
     col_indices: torch.Tensor,
     kernel_metadata: torch.Tensor | None = None,
+    mosca_fold: dict | None = None,
 ) -> torch.Tensor:
     """Sparse-MQA logits + top-k for paged decode rows.
 
@@ -488,14 +489,63 @@ def sparse_mqa_logits_paged_decode(
         sparse_indices.shape[1],
         sparse_block_kv,
     )
-    sparse_topk_remap(
-        logits,
+    if mosca_fold is None:
+        sparse_topk_remap(
+            logits,
+            sparse_indices,
+            end,
+            row_ks,
+            sparse_block_kv,
+            topk_tokens,
+            topk_indices,
+            col_indices=col_indices,
+        )
+        return kernel_metadata
+    # MOSCA IDX-FOLD: DeepSelect as served, then one kernel for the
+    # topk_indices_buffer fill, the remap and the index source's translation.
+    from vllm.models.deepseek_v41.common.ops.mosca_idx_fold import remap_translate
+
+    assert logits.dtype == torch.bfloat16 and logits.shape[1] >= topk_tokens
+    cols = col_indices[:rows]
+    deep_select_topk(logits, topk_tokens, end=end, output_idx=cols)
+    indices, lens = remap_translate(
+        cols,
         sparse_indices,
-        end,
         row_ks,
         sparse_block_kv,
         topk_tokens,
-        topk_indices,
-        col_indices=col_indices,
+        logits.shape[1],
+        mosca_fold["topk_buffer"],
+        rows,
+        mosca_fold["n_fill"],
+        mosca_fold["token_to_req"],
+        mosca_fold["is_valid"],
+        mosca_fold["block_table"],
+        mosca_fold["page"],
+        mosca_fold["num_decode_tokens"],
     )
+    mosca_fold["publish"](indices, lens)
+    from vllm.models.deepseek_v41.common.ops import mosca_idx_fold_serve as S
+
+    S.census_add(mosca_fold["num_decode_tokens"], "rt", mosca_fold["key"])
+    if S.VERIFY_STEPS > 0:
+        # the served fill + remap of the same DeepSelect output, compared on the GPU
+        buf = mosca_fold["topk_buffer"]
+        n = max(int(mosca_fold["n_fill"]), rows)
+        ref = torch.full((n, buf.shape[1]), -1, dtype=buf.dtype, device=buf.device)
+        _sparse_topk_remap_kernel[(rows,)](
+            cols,
+            cols.stride(0),
+            sparse_indices,
+            sparse_indices.stride(0),
+            row_ks,
+            row_ks.stride(0),
+            ref,
+            ref.stride(0),
+            topk_tokens,
+            logits.shape[1],
+            SBK=sparse_block_kv,
+            K_POW2=triton.next_power_of_2(topk_tokens),
+        )
+        S.verify_tensors((ref, buf[:n]))
     return kernel_metadata

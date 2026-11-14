@@ -1060,12 +1060,29 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
         if self.indexer is not None and index_q is not None:
             assert index_weights is not None
             q_quant = (index_q, index_q_scale) if index_q_scale is not None else index_q
-            self.indexer.indexer_op(
-                hidden_states,
-                q_quant,
-                None,
-                index_weights,
-            )
+            # MOSCA IDX-FOLD (default off): an index source hands its sparse
+            # indexer the translation context (mega attention backend only).
+            producer_ctx = getattr(self, "mosca_producer_ctx", None)
+            producer_ctx = producer_ctx() if producer_ctx is not None else None
+            if producer_ctx is None:
+                self.indexer.indexer_op(
+                    hidden_states,
+                    q_quant,
+                    None,
+                    index_weights,
+                )
+            else:
+                from vllm.models.deepseek_v41.common.ops.mosca_idx_fold_serve import (
+                    armed,
+                )
+
+                with armed(producer_ctx):
+                    self.indexer.indexer_op(
+                        hidden_states,
+                        q_quant,
+                        None,
+                        index_weights,
+                    )
 
         # MLA attention writes into the pre-allocated `out` buffer
         # ([num_tokens, padded_heads, head_dim]).

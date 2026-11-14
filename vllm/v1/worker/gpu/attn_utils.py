@@ -470,6 +470,10 @@ def build_slot_mappings_by_layer(
     return slot_mappings_by_layer
 
 
+# MOSCA IDX-FOLD (VLLM_MOSCA_IDX_FOLD, default off): see _build_attn_metadata_idx_fold.
+_MOSCA_IDX_FOLD = __import__("os").environ.get("VLLM_MOSCA_IDX_FOLD", "0") == "1"
+
+
 def build_attn_metadata(
     attn_groups: list[list[AttentionGroup]],
     num_reqs: int,
@@ -496,6 +500,35 @@ def build_attn_metadata(
     fast_prefill: FastPrefillBatchMetadata | None = None,
     req_idx: np.ndarray | None = None,
 ) -> dict[str, Any]:
+    if _MOSCA_IDX_FOLD and not for_cudagraph_capture and ubatch_idx == 0:
+        folded = _build_attn_metadata_idx_fold(
+            attn_groups=attn_groups,
+            num_reqs=num_reqs,
+            num_tokens=num_tokens,
+            query_start_loc_gpu=query_start_loc_gpu,
+            query_start_loc_cpu=query_start_loc_cpu,
+            max_query_len=max_query_len,
+            seq_lens=seq_lens,
+            max_seq_len=max_seq_len,
+            block_tables=block_tables,
+            slot_mappings=slot_mappings,
+            kv_cache_config=kv_cache_config,
+            seq_lens_cpu_upper_bound=seq_lens_cpu_upper_bound,
+            dcp_local_seq_lens=dcp_local_seq_lens,
+            dcp_local_seq_lens_cpu_upper_bound=dcp_local_seq_lens_cpu_upper_bound,
+            positions=positions,
+            is_prefilling=is_prefilling,
+            mm_req_doc_ranges=mm_req_doc_ranges,
+            model_specific_attn_metadata=model_specific_attn_metadata,
+            for_cudagraph_capture=for_cudagraph_capture,
+            causal=causal,
+            rswa_prefix_lens=rswa_prefix_lens,
+            ubatch_idx=ubatch_idx,
+            fast_prefill=fast_prefill,
+            req_idx=req_idx,
+        )
+        if folded is not None:
+            return folded
     seq_lens = seq_lens[:num_reqs]
     if dcp_local_seq_lens is not None:
         dcp_local_seq_lens = dcp_local_seq_lens[:num_reqs]
@@ -595,3 +628,207 @@ def build_attn_metadata(
                 attn_metadata[layer_name] = metadata
         token_to_req_indices = common_attn_metadata._token_to_req_indices_cache
     return attn_metadata
+
+
+def _build_attn_metadata_idx_fold(
+    attn_groups: list[list[AttentionGroup]],
+    num_reqs: int,
+    num_tokens: int,
+    query_start_loc_gpu: torch.Tensor,
+    query_start_loc_cpu: torch.Tensor,
+    max_query_len: int,
+    seq_lens: torch.Tensor,
+    max_seq_len: int,
+    block_tables: Sequence[torch.Tensor],
+    slot_mappings: torch.Tensor,
+    kv_cache_config: KVCacheConfig,
+    seq_lens_cpu_upper_bound: torch.Tensor | None = None,
+    dcp_local_seq_lens: torch.Tensor | None = None,
+    dcp_local_seq_lens_cpu_upper_bound: torch.Tensor | None = None,
+    positions: torch.Tensor | None = None,
+    is_prefilling: torch.Tensor | None = None,
+    mm_req_doc_ranges: dict[int, list[tuple[int, int]]] | None = None,
+    model_specific_attn_metadata: ModelSpecificAttnMetadata | None = None,
+    for_cudagraph_capture: bool = False,
+    causal: bool | torch.Tensor | Mapping[int, bool] = True,
+    rswa_prefix_lens: torch.Tensor | None = None,
+    ubatch_idx: int = 0,
+    fast_prefill: FastPrefillBatchMetadata | None = None,
+    req_idx: np.ndarray | None = None,
+) -> dict[str, Any] | None:
+    """MOSCA IDX-FOLD: build_attn_metadata in two passes. Pass 1 builds every group's
+    CommonAttentionMetadata and collects, in the served order, the decode-metadata kernels
+    the builders would launch; they run as ONE kernel; pass 2 is the served build loop
+    (the builders skip the folded kernels). None: nothing to fold, the caller runs the
+    served function unchanged."""
+    seq_lens = seq_lens[:num_reqs]
+    if dcp_local_seq_lens is not None:
+        dcp_local_seq_lens = dcp_local_seq_lens[:num_reqs]
+    if dcp_local_seq_lens_cpu_upper_bound is not None:
+        dcp_local_seq_lens_cpu_upper_bound = dcp_local_seq_lens_cpu_upper_bound[
+            :num_reqs
+        ]
+    if seq_lens_cpu_upper_bound is not None:
+        seq_lens_cpu_upper_bound = seq_lens_cpu_upper_bound[:num_reqs]
+
+    attn_metadata: dict[str, Any] = {}
+    token_to_req_indices: torch.Tensor | None = None
+    # Mamba groups with the same spec and builder differ only in their state
+    # indices, so later groups re-gather those from the first group's metadata.
+    # Also at capture, so FULL graphs share the batch-level buffers.
+    cached_metadata: dict[tuple[KVCacheSpec, type], Any] = {}
+    num_kv_cache_groups = len(kv_cache_config.kv_cache_groups)
+    from vllm.models.deepseek_v41.common.ops.mosca_idx_fold_serve import (
+        StepMetaCollector,
+    )
+
+    collector = StepMetaCollector()
+    common_metadata_by_group: list[CommonAttentionMetadata | None] = []
+    for i in range(num_kv_cache_groups):
+        if not attn_groups[i]:
+            common_metadata_by_group.append(None)
+            continue
+        block_table = block_tables[i]
+        slot_mapping = slot_mappings[i]
+        # Per-group causal for hybrid drafters (mixed SWA/full attention).
+        group_causal = (
+            causal if isinstance(causal, (bool, torch.Tensor)) else causal.get(i, True)
+        )
+
+        common_attn_metadata_extra_kwargs = (
+            model_specific_attn_metadata.get_extra_common_attn_kwargs(i, num_reqs)
+            if model_specific_attn_metadata is not None
+            else {}
+        )
+        # Model-specific metadata (e.g. Mamba hybrid) may supply its own
+        # padding-aware is_prefilling, which takes precedence over the default.
+        group_is_prefilling = common_attn_metadata_extra_kwargs.pop(
+            "is_prefilling", is_prefilling
+        )
+        if fast_prefill is not None:
+            common_attn_metadata_extra_kwargs.update(
+                logits_indices_padded=fast_prefill.logits_indices_padded,
+                num_logits_indices=fast_prefill.num_logits_indices,
+                max_logits_per_req=fast_prefill.max_logits_per_req,
+            )
+        common_attn_metadata = CommonAttentionMetadata(
+            query_start_loc=query_start_loc_gpu,
+            query_start_loc_cpu=query_start_loc_cpu,
+            seq_lens=seq_lens,
+            seq_lens_cpu_upper_bound=seq_lens_cpu_upper_bound,
+            max_seq_len=max_seq_len,
+            num_reqs=num_reqs,
+            num_actual_tokens=num_tokens,
+            max_query_len=max_query_len,
+            block_table_tensor=block_table,
+            slot_mapping=slot_mapping,
+            causal=group_causal,
+            dcp_local_seq_lens=dcp_local_seq_lens,
+            dcp_local_seq_lens_cpu_upper_bound=dcp_local_seq_lens_cpu_upper_bound,
+            positions=positions,
+            is_prefilling=group_is_prefilling,
+            mm_req_doc_ranges=mm_req_doc_ranges,
+            rswa_prefix_lens=rswa_prefix_lens,
+            req_idx=req_idx,
+            _token_to_req_indices_cache=token_to_req_indices,
+            **common_attn_metadata_extra_kwargs,
+        )
+        common_metadata_by_group.append(common_attn_metadata)
+        for attn_group in attn_groups[i]:
+            builder = attn_group.get_metadata_builder(ubatch_idx)
+            fold_builds = getattr(builder, "mosca_fold_builds", None)
+            if fold_builds is None:
+                if common_attn_metadata._token_to_req_indices_cache is None:
+                    # a builder without the hook may compute the request map
+                    # into its own buffer first: run the served function
+                    collector.release("hookless_builder")
+                    return None
+                continue
+            extra = (
+                model_specific_attn_metadata.get_extra_attn_kwargs(builder, num_reqs)
+                if model_specific_attn_metadata is not None
+                else {}
+            )
+            kind_builds = fold_builds(common_attn_metadata, **extra)
+            if kind_builds is not None:
+                collector.add(
+                    builder,
+                    kind_builds,
+                    common_attn_metadata,
+                    common_attn_metadata._token_to_req_indices_cache,
+                )
+        token_to_req_indices = common_attn_metadata._token_to_req_indices_cache
+    if not collector.builders:
+        return None
+    if not collector.has_decode_shape():
+        # MOSCA IDX-FOLD: the fold is a decode-step fold whose shape (T, the decode
+        # tokens) comes from the decode-aware builds (SWA, indexer). A step none of
+        # them folds (prefill rows, the mixed prefill / decode warmup batch) runs the
+        # served function whole: every builder that offered a build is released.
+        collector.release("no_decode_shape")
+        return None
+    collector.launch(**collector_shape_kwargs(collector, num_tokens, num_reqs))
+    for i in range(num_kv_cache_groups):
+        common_attn_metadata = common_metadata_by_group[i]
+        if common_attn_metadata is None:
+            continue
+        block_table = block_tables[i]
+        slot_mapping = slot_mappings[i]
+
+        for attn_group in attn_groups[i]:
+            attn_metadata_builder = attn_group.get_metadata_builder(ubatch_idx)
+            reuse_key = None
+            if attn_metadata_builder.supports_update_block_table and isinstance(
+                attn_group.kv_cache_spec, MambaSpec
+            ):
+                reuse_key = (attn_group.kv_cache_spec, type(attn_metadata_builder))
+            if reuse_key in cached_metadata:
+                metadata = attn_metadata_builder.update_block_table(
+                    cached_metadata[reuse_key], block_table, slot_mapping
+                )
+            elif for_cudagraph_capture:
+                metadata = attn_group.build_metadata_for_cudagraph_capture(
+                    common_attn_metadata, ubatch_idx
+                )
+            else:
+                attn_metadata_extra_kwargs = (
+                    model_specific_attn_metadata.get_extra_attn_kwargs(
+                        attn_metadata_builder,
+                        num_reqs,
+                    )
+                    if model_specific_attn_metadata is not None
+                    else {}
+                )
+                metadata = attn_group.build_metadata(
+                    common_attn_metadata, ubatch_idx, **attn_metadata_extra_kwargs
+                )
+            if reuse_key is not None and reuse_key not in cached_metadata:
+                cached_metadata[reuse_key] = metadata
+            for layer_name in attn_group.layer_names:
+                attn_metadata[layer_name] = metadata
+    collector.finish()
+    return attn_metadata
+
+
+def collector_shape_kwargs(collector, num_tokens: int, num_reqs: int) -> dict:
+    """The fold's shape arguments, read from the collected builds (data)."""
+    swa = collector.swa
+    widths = {b["block_table"].shape[1] for b in collector.csm + collector.idx}
+    assert len(widths) <= 1, widths
+    # the served compressed slot mapping runs one program per block-table row
+    csm_rows = {b["block_table"].shape[0] for b in collector.csm}
+    assert len(csm_rows) <= 1, csm_rows
+    return dict(
+        # is_valid_token covers the whole slot mapping the SWA builds read
+        num_tokens=collector.shape.get("N", num_tokens),
+        num_decode_tokens=collector.decode_tokens,
+        num_reqs=csm_rows.pop() if csm_rows else num_reqs,
+        num_decodes=collector.decodes,
+        window_size=collector.window_size,
+        swa_block_size=collector.swa_block_size,
+        index_width=collector.index_width,
+        block_table_cols=widths.pop() if widths else 1,
+        lens_numel=swa[0]["lens"].numel() if swa else 0,
+        csm_numel=collector.csm[0]["out"].numel() if collector.csm else 0,
+        step_idx=collector.step_idx(),
+    )

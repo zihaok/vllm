@@ -1478,6 +1478,68 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
 
         return chunks
 
+    def mosca_fold_builds(
+        self, common_attn_metadata: CommonAttentionMetadata, **_: Any
+    ) -> list[tuple[str, dict]] | None:
+        """MOSCA IDX-FOLD: the decode kernels ``build`` would launch (the
+        compressed slot mapping and the varlen ``_indexer_decode_metadata_kernel``
+        with its ``seq_lens //= compress_ratio``), as data for the step's one fold
+        launch. The DeepGEMM schedule stays in ``build``. None keeps the step
+        served (prefill rows, context parallel, the non-varlen layouts)."""
+        cm = common_attn_metadata
+        if (
+            self.use_pcp
+            or self.dcp_world_size > 1
+            or not self.supports_varlen
+            or cm.num_actual_tokens == 0
+            or self.compress_ratio not in (1, 2)
+        ):
+            return None
+        num_decodes, num_prefills, num_decode_tokens, _ = split_decodes_and_prefills(
+            cm,
+            decode_threshold=self.decode_threshold,
+            require_uniform=False,
+            treat_short_extends_as_decodes=True,
+        )
+        if num_prefills > 0 or num_decodes == 0:
+            return None
+        if num_decode_tokens > self.expanded_block_table_buffer.shape[0]:
+            return None
+        builds: list[tuple[str, dict]] = []
+        if self.compress_ratio > 1:
+            builds.append(
+                (
+                    "csm",
+                    dict(
+                        block_table=cm.block_table_tensor,
+                        slot_mapping=cm.slot_mapping,
+                        out=self.compressed_slot_mapping_buffer,
+                        block_size=int(self.kv_cache_spec.num_states),
+                        ratio=self.compress_ratio,
+                        clamp_rows=0,
+                    ),
+                )
+            )
+        builds.append(
+            (
+                "idx",
+                dict(
+                    block_table=cm.block_table_tensor[:num_decodes, ...],
+                    out_seq_lens=self.decode_seq_lens_buffer,
+                    out_block_table=self.expanded_block_table_buffer,
+                    decode_lens=self.decode_lens_buffer,
+                    indices=self.decode_indices_buffer,
+                    per_req_lens=self.per_req_decode_lens_buffer,
+                    capacity=self.decode_seq_lens_buffer.numel(),
+                    ratio=self.compress_ratio,
+                    _T=num_decode_tokens,
+                    _num_decodes=num_decodes,
+                ),
+            )
+        )
+        self._mosca_folded = True
+        return builds
+
     def build(
         self,
         common_prefix_len: int,
@@ -1494,7 +1556,12 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
         dcp_local_seq_lens = common_attn_metadata.dcp_local_seq_lens
 
         compressed_slot_mapping = slot_mapping
-        if self.compress_ratio > 1:
+        mosca_folded = getattr(self, "_mosca_folded", False)
+        self._mosca_folded = False
+        if self.compress_ratio > 1 and mosca_folded:
+            # MOSCA IDX-FOLD: written by the step's fold launch.
+            compressed_slot_mapping = self.compressed_slot_mapping_buffer[:num_tokens]
+        elif self.compress_ratio > 1:
             padded_num_tokens = num_tokens
             local_slot_mapping = slot_mapping
             if self.use_pcp:
@@ -1741,23 +1808,26 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
                     num_decodes,
                     num_decode_tokens + triton.cdiv(capacity - num_decode_tokens, 256),
                 )
-                _indexer_decode_metadata_kernel[(grid,)](
-                    query_start_loc,
-                    seq_lens,
-                    block_table,
-                    self.decode_seq_lens_buffer,
-                    self.expanded_block_table_buffer,
-                    self.decode_lens_buffer,
-                    self.decode_indices_buffer,
-                    self.per_req_decode_lens_buffer,
-                    num_decodes,
-                    num_decode_tokens,
-                    capacity,
-                    block_table.stride(0),
-                    self.expanded_block_table_buffer.stride(0),
-                    BLOCK_COLS=block_table.shape[1],
-                    num_warps=4,
-                )
+                # MOSCA IDX-FOLD: when folded, the step's fold launch wrote these
+                # buffers (and the seq_lens //= compress_ratio below).
+                if not mosca_folded:
+                    _indexer_decode_metadata_kernel[(grid,)](
+                        query_start_loc,
+                        seq_lens,
+                        block_table,
+                        self.decode_seq_lens_buffer,
+                        self.expanded_block_table_buffer,
+                        self.decode_lens_buffer,
+                        self.decode_indices_buffer,
+                        self.per_req_decode_lens_buffer,
+                        num_decodes,
+                        num_decode_tokens,
+                        capacity,
+                        block_table.stride(0),
+                        self.expanded_block_table_buffer.stride(0),
+                        BLOCK_COLS=block_table.shape[1],
+                        num_warps=4,
+                    )
                 seq_lens = self.decode_seq_lens_buffer[:num_decode_tokens]
                 block_table = self.expanded_block_table_buffer[:num_decode_tokens]
                 decode_lens = self.decode_lens_buffer[:num_decode_tokens]
@@ -1802,7 +1872,7 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
 
             # For DeepseekV4 (compress_ratio > 1), the indexer KV cache stores
             # compressed tokens. Convert uncompressed seq_lens to compressed.
-            if self.compress_ratio > 1:
+            if self.compress_ratio > 1 and not mosca_folded:
                 if seq_lens_is_buffer_view:
                     seq_lens //= self.compress_ratio
                 else:

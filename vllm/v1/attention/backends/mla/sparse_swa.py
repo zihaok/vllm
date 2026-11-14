@@ -582,6 +582,47 @@ class DeepseekSparseSWAMetadataBuilder(AttentionMetadataBuilder):
             device=self.device,
         )
 
+    def mosca_fold_builds(
+        self,
+        common_attn_metadata: CommonAttentionMetadata,
+        replay_start: torch.Tensor | None = None,
+        **_: Any,
+    ) -> list[tuple[str, dict]] | None:
+        """MOSCA IDX-FOLD: the decode SWA kernels ``build`` would launch
+        (is_valid_token, the lens tail, the causal window indices), as data for
+        the step's one fold launch. None keeps the step served (prefill rows,
+        the DSpark non-causal block)."""
+        cm = common_attn_metadata
+        num_decodes, _, num_decode_tokens, num_prefill_tokens = (
+            split_decodes_and_prefills(cm, decode_threshold=self.decode_threshold)
+        )
+        if num_prefill_tokens > 0 or num_decode_tokens == 0 or not cm.causal:
+            return None
+        token_to_req_indices = cm.token_to_req_indices(self.token_to_req_indices)
+        assert token_to_req_indices is not None
+        self._mosca_folded = True
+        return [
+            (
+                "swa",
+                dict(
+                    slot_mapping=cm.slot_mapping,
+                    block_table=cm.block_table_tensor,
+                    replay_start=(
+                        replay_start if replay_start is not None else self.no_replay_start
+                    ),
+                    is_valid=self.is_valid_token,
+                    indices=self.decode_swa_indices.view(self._max_tokens, -1),
+                    lens=self.decode_swa_lens,
+                    _T=num_decode_tokens,
+                    _N=cm.slot_mapping.shape[0],
+                    _num_decodes=num_decodes,
+                    _window=self.window_size,
+                    _swa_block=self.block_size,
+                    _index_width=self.decode_swa_indices.shape[-1],
+                ),
+            )
+        ]
+
     def build(
         self,
         common_prefix_len: int,
@@ -622,7 +663,12 @@ class DeepseekSparseSWAMetadataBuilder(AttentionMetadataBuilder):
         )
 
         is_valid_token = self.is_valid_token[: slot_mapping.shape[0]]
-        torch.ge(slot_mapping, 0, out=is_valid_token)
+        # MOSCA IDX-FOLD: the step's fold launch already wrote is_valid_token,
+        # the lens tail and the decode window indices of this group.
+        mosca_folded = getattr(self, "_mosca_folded", False)
+        self._mosca_folded = False
+        if not mosca_folded:
+            torch.ge(slot_mapping, 0, out=is_valid_token)
         if replay_start is None:
             # Graph captures build without it; their dummy batches replay nothing.
             replay_start = self.no_replay_start
@@ -632,7 +678,7 @@ class DeepseekSparseSWAMetadataBuilder(AttentionMetadataBuilder):
             self.noncausal_index_width if non_causal else self.window_size
         )
         decode_swa_indices = self.decode_swa_indices
-        if num_decode_tokens > 0:
+        if num_decode_tokens > 0 and not mosca_folded:
             self.decode_swa_lens[num_decode_tokens:] = 0
             if non_causal:
                 assert self.is_dspark, (
