@@ -41,6 +41,13 @@ under CUDA graphs every rank is padded to it). Buckets, variant and per-bucket k
                                 FlashInfer's own defaults for the variant; the w4a8 layers' table
   VLLM_MOSCA_OFFICIAL_KNOBS_NVFP4  the same for the w4a4 layers (one table per format, each format's env in OFFICIAL_FORMATS)
   VLLM_MOSCA_OFFICIAL_SHARED    1 (default): fuse the shared expert; 0: the model runs its shared MLP serially
+  VLLM_MOSCA_OFFICIAL_FRONT2    0 (default): the served front above; 1: FRONT2 for the formats in FRONT2_DEFAULT_FORMATS
+                                (w4a4); or a comma list of format words (w4a4,w4a8). FRONT2 = DeepGEMM's
+                                ``bf16_mega_gate_front2``: the gate (same config, bias + image bias / mask) + the EPLB map /
+                                record + padding -1 + int32 + the format's staging + the fused shared expert's MXFP8 input in
+                                ONE launch, written into the bucket workspace's planes (FlashInfer ``stage_external``), then
+                                the kernel (``compute_staged``). Taken by the model's fused-front hook where its gate runs
+                                DeepGEMM's mega gate (T above the GateLinear threshold); bit-identical to the unfused chain.
 Census lines (WARNING, prefix ``MOSCA_OFFICIAL``) name every armed layer, every built workspace and the call
 counts per bucket, on every decode rank.
 """
@@ -76,10 +83,27 @@ logger = init_logger("vllm.mosca.official_megamoe")
 OFFICIAL_SWITCH = "VLLM_MOSCA_OFFICIAL_MEGAMOE"
 KERNEL_SRC = "cutedsl_megamoe 70a6878d + export patches (FlashInfer PR #9426 4c891e24), FlashInfer shared expert"
 _GLUE = "official-armA-v5"
+FRONT2_SWITCH = "VLLM_MOSCA_OFFICIAL_FRONT2"
+FRONT2_DEFAULT_FORMATS = ("w4a4",)
+FRONT2_FORMAT_CODE = {"w4a4": 0, "w4a8": 1}  # DeepGEMM bf16_mega_gate_front2 staging format per routed format (DATA)
 
 
 def official_megamoe_enabled() -> bool:
     return os.environ.get(OFFICIAL_SWITCH, "0").strip() not in ("", "0")
+
+
+def official_front2_formats() -> frozenset[str]:
+    """The routed formats FRONT2 serves (``VLLM_MOSCA_OFFICIAL_FRONT2``): empty = off (default)."""
+    raw = os.environ.get(FRONT2_SWITCH, "0").strip().replace(" ", "")
+    if raw in ("", "0"):
+        return frozenset()
+    if raw == "1":
+        return frozenset(FRONT2_DEFAULT_FORMATS)
+    words = frozenset(w for w in raw.split(",") if w)
+    unknown = sorted(words - set(FRONT2_FORMAT_CODE))
+    if unknown:
+        raise ValueError(f"official_front2_format_unknown:{','.join(unknown)} (known {sorted(FRONT2_FORMAT_CODE)})")
+    return words
 
 
 # --------------------------------------------------------------------------------------------- FlashInfer import
@@ -297,6 +321,8 @@ _census = {
     "calls": collections.Counter(),
     "keys": collections.Counter(),
     "formats": collections.Counter(),
+    "front2": collections.Counter(),
+    "front2_calls": 0,
     "armed": 0,
     "workspaces": set(),
     "n": 0,
@@ -309,8 +335,10 @@ def _census_summary(tag: str) -> None:
     calls = ",".join(f"{k}:{v}" for k, v in sorted(_census["calls"].items(), key=lambda x: str(x[0])))
     keys = ",".join(f"{k}:{v}" for k, v in sorted(_census["keys"].items()))
     formats = ",".join(f"{k}:{v}" for k, v in sorted(_census["formats"].items()))
+    front2 = ",".join(f"{k}:{v}" for k, v in sorted(_census["front2"].items()))
     logger.warning(
-        "MOSCA_OFFICIAL calls tag=%s rank=%s armed=%d workspaces=%d n=%d per_bucket=%s key_words=%s glue=%s formats=%s",
+        "MOSCA_OFFICIAL calls tag=%s rank=%s armed=%d workspaces=%d n=%d per_bucket=%s key_words=%s glue=%s formats=%s "
+        "front2_layers=%s front2_calls=%d",
         tag,
         _census.get("rank", "?"),
         _census["armed"],
@@ -320,6 +348,8 @@ def _census_summary(tag: str) -> None:
         keys or "none",
         _GLUE,
         formats or "none",
+        front2 or "none",
+        _census["front2_calls"],
     )
 
 
@@ -478,6 +508,72 @@ def official_forward(
     return mega.forward(tensors, workspace=handle)
 
 
+def official_front2_forward(
+    mega: Any,
+    handle: Any,
+    front2: Any,
+    hidden_states: torch.Tensor,
+    gate_weight: torch.Tensor,
+    gate_bias: torch.Tensor,
+    top_k: int,
+    *,
+    scoring_func: str,
+    routed_scaling_factor: float,
+    ep_rank: int,
+    front2_format: int,
+    image_bias: torch.Tensor | None = None,
+    image_token_mask: torch.Tensor | None = None,
+    is_padding: torch.Tensor | None = None,
+    logical_to_physical: torch.Tensor | None = None,
+    replica_count: torch.Tensor | None = None,
+    expert_load: torch.Tensor | None = None,
+    record_enabled: torch.Tensor | None = None,
+    num_unpadded_tokens: torch.Tensor | None = None,
+    epilogue: OfficialEpilogue | None = None,
+) -> torch.Tensor:
+    """FRONT2, then the kernel on ``handle``: one DeepGEMM ``bf16_mega_gate_front2`` launch (``front2``) writes the
+    workspace's planes (FlashInfer ``stage_external``: the format's activation + scale planes under the backend's own
+    offline normalization, int32 physical routes with -1 over the capacity tail, fp32 scores, the fused shared expert's
+    swizzled MXFP8 input) and records the EPLB load; ``compute_staged`` runs the kernel into an owned output allocated
+    ahead of staging (FlashInfer ``forward``'s order). The same bytes as the served chain: ``bf16_mega_gate`` -> EPLB map /
+    record -> padding -1 -> int32 -> ``official_forward``. w4a4 binds its per-expert epilogue vectors at staging."""
+    num_tokens, hidden = hidden_states.shape
+    output = torch.empty(num_tokens, hidden, dtype=torch.bfloat16, device=hidden_states.device)
+    if epilogue is None:
+        planes = mega.stage_external(num_tokens, workspace=handle)
+    else:
+        planes = mega.stage_external(num_tokens, workspace=handle, tensors=types.SimpleNamespace(**epilogue.tensors()))
+    u8 = torch.uint8
+    shared = "shared_activation" in planes
+    front2(
+        hidden_states,
+        gate_weight,
+        top_k,
+        routed_scaling_factor,
+        ep_rank,
+        gate_bias,
+        planes["x"].view(u8),
+        planes["x_sf"].view(u8),
+        planes["topk_idx"],
+        planes["topk_weights"],
+        scoring_func=scoring_func,
+        image_bias=image_bias,
+        image_token_mask=image_token_mask,
+        format=front2_format,
+        norm_const=planes.get("offline_norm_const", 1.0),
+        scale_multiplier=planes.get("offline_scale_multiplier", 1.0),
+        is_padding=is_padding,
+        logical_to_physical=logical_to_physical,
+        replica_count=replica_count,
+        expert_load=expert_load,
+        record_enabled=record_enabled,
+        num_unpadded_tokens=num_unpadded_tokens,
+        xs_q=planes["shared_activation"].view(u8) if shared else None,
+        xs_sf=planes["shared_activation_sf"].view(u8) if shared else None,
+    )
+    return mega.compute_staged(output=output)
+
+
 # --------------------------------------------------------------------------------------------- post-load hook
 class _OfficialPostLoad(QuantizeMethodBase):
     """Runs once after the checkpoint is loaded: hands the weights to FlashInfer (vLLM's post-load loop)."""
@@ -523,6 +619,8 @@ class MoscaOfficialMegaMoEExperts(DeepGemmMegaMoEExperts):
         self._handles: dict[int, Any] = {}
         self._kernel_views: list[torch.Tensor] | None = None
         self._geometry = f"E{self.num_experts}k{self.top_k}"
+        self._front2_fn: Any = None
+        self._front2_word = "undecided"
         self.quant_method = _OfficialPostLoad()
 
     # ---- shared expert: fused when the shared MLP is one unsharded MXFP8 expert of a supported width
@@ -549,6 +647,109 @@ class MoscaOfficialMegaMoEExperts(DeepGemmMegaMoEExperts):
         # One fused shared expert of width shared_size (FlashInfer Sm107SharedExpertConfig.intermediate_size).
         self._shared_width = shared_size
         return 1, spec
+
+    # ---- FRONT2: the model's fused-front hook. The official entry's front takes the image bias + mask, so the
+    #      model admits vision checkpoints for this class; the switch and the layer's format decide (_front2_decide).
+    fused_front_takes_image_routing: ClassVar[bool] = True
+
+    def supports_fused_front(self) -> bool:
+        """FRONT2 serves this layer's next call: armed at build (switch on, format admitted, DeepGEMM has the op) and no
+        routing capture (the front writes physical ids only)."""
+        return self._front2_fn is not None and self.capture_fn is None
+
+    def _front2_decide(self) -> None:
+        """Arm FRONT2 for this layer once (after the build): ``armed:format<k>``, ``off``, or a typed refusal."""
+        formats = official_front2_formats()
+        fn, word = None, "off"
+        if formats:
+            if self._official.word not in formats:
+                word = f"not_admitted:format_{self._official.word}"
+            else:
+                from vllm.utils.deep_gemm import _import_deep_gemm
+
+                dg = _import_deep_gemm()
+                fn = getattr(dg, "bf16_mega_gate_front2", None) if dg is not None else None
+                if fn is None:
+                    word = "unavailable:deep_gemm_lacks_bf16_mega_gate_front2"
+                elif not hasattr(self._mega, "stage_external"):
+                    fn, word = None, "unavailable:flashinfer_lacks_stage_external"
+                else:
+                    word = f"armed:format{FRONT2_FORMAT_CODE[self._official.word]}"
+        self._front2_fn, self._front2_word = fn, word
+        _census["front2"][word.split(":")[0]] += 1
+        if formats:
+            logger.warning(
+                "MOSCA_OFFICIAL front2 layer=%s rank=%d/%d format=%s word=%s deep_gemm=%s",
+                self.prefix,
+                self._ep_rank,
+                self._ep_world,
+                self._official.word,
+                word,
+                getattr(sys.modules.get(getattr(fn, "__module__", "") or ""), "__file__", None),
+            )
+
+    def forward_fused_front(
+        self,
+        hidden_states: torch.Tensor,
+        gate_weight: torch.Tensor,
+        gate_bias: torch.Tensor,
+        num_topk: int,
+        *,
+        scoring_func: str,
+        routed_scaling_factor: float,
+        ep_rank: int,
+        shared_experts: nn.Module | None = None,
+        image_bias: torch.Tensor | None = None,
+        image_token_mask: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """The model's gate (``bf16_mega_gate``) and :meth:`forward` in one FRONT2 launch + the kernel (same outputs)."""
+        if shared_experts is not None and self.has_fused_shared_experts:
+            raise ValueError(f"{self.prefix} fuses the shared expert; pass shared_experts=None.")
+        if self._mega is None or self._front2_fn is None:
+            raise RuntimeError(f"{self.prefix}: FRONT2 called while not armed ({self._front2_word})")
+        if not getattr(self, "_warmed", False):
+            self._warm_all_buckets()
+        num_tokens = hidden_states.shape[0]
+        key, word = _rank_uniform_key(num_tokens)
+        bucket = self._bucket_for(key)
+        _census_call(self._geometry, bucket, word)
+        _census["front2_calls"] += 1
+
+        import vllm.envs as envs
+        from vllm.forward_context import get_forward_context, is_forward_context_available
+        from vllm.model_executor.layers.fused_moe.prepare_megamoe import _eplb_kernel_args
+
+        is_padding = None
+        if envs.VLLM_MOE_SKIP_PADDING and is_forward_context_available():
+            padding = get_forward_context().is_padding
+            if padding is not None:
+                is_padding = padding[:num_tokens].to(torch.bool)
+        mapping, replicas, load, record, unpadded = _eplb_kernel_args(self.eplb_state)[:5]
+        y = official_front2_forward(
+            self._mega,
+            self._handles[bucket],
+            self._front2_fn,
+            hidden_states,
+            gate_weight,
+            gate_bias,
+            num_topk,
+            scoring_func=scoring_func,
+            routed_scaling_factor=routed_scaling_factor,
+            ep_rank=ep_rank,
+            front2_format=FRONT2_FORMAT_CODE[self._official.word],
+            image_bias=image_bias,
+            image_token_mask=image_token_mask,
+            is_padding=is_padding,
+            logical_to_physical=mapping,
+            replica_count=replicas,
+            expert_load=load,
+            record_enabled=record,
+            num_unpadded_tokens=unpadded,
+            epilogue=self._epilogue,
+        )
+        if shared_experts is not None:
+            y = y + shared_experts(hidden_states)
+        return y
 
     # ---- canonical (checkpoint) layout: [E, rows, K / values_per_element] data and [E, rows, K / group] scale bytes;
     #      w4a4 adds the checkpoint's per-expert fp32 global scales (``weight_scale_2``, ``input_scale``)
@@ -692,6 +893,7 @@ class MoscaOfficialMegaMoEExperts(DeepGemmMegaMoEExperts):
             self._format_source,
             "none" if epi is None else f"w13_amax:{epi.w13_amax:.6g},w2_amax:{epi.w2_amax:.6g}",
         )
+        self._front2_decide()
 
     def get_expert_weights(self) -> list[torch.Tensor]:
         """Kernel-resident routed tensors as ``(num_local_experts, -1)`` byte views (EPLB moves rows in place); w4a4 adds

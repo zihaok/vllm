@@ -504,6 +504,28 @@ class DeepseekV4MoE(nn.Module):
                 raise RuntimeError(
                     "MegaMoE routing metadata must be prepared once by the model."
                 )
+            # MOSCA FRONT2 for the official experts (VLLM_MOSCA_OFFICIAL_FRONT2, default off, decides
+            # supports_fused_front): gate + EPLB map/record + the format's staging + the shared expert's input in
+            # one launch. Its front takes the image bias and mask, so vision checkpoints are admitted here; other
+            # experts do not declare fused_front_takes_image_routing.
+            if (
+                getattr(self.experts, "fused_front_takes_image_routing", False)
+                and self.gate.tid2eid is None
+                and self.gate.e_score_correction_bias is not None
+                and self.experts.supports_fused_front()
+            ):
+                return self.experts.forward_fused_front(
+                    hidden_states,
+                    self.gate.weight,
+                    self.gate.e_score_correction_bias.data,
+                    self.n_activated_experts,
+                    scoring_func=self.scoring_func,
+                    routed_scaling_factor=self.routed_scaling_factor,
+                    ep_rank=self.ep_rank,
+                    shared_experts=self.shared_experts,
+                    image_bias=bias_vl.data if bias_vl is not None else None,
+                    image_token_mask=mega_gate_metadata.image_token_mask,
+                ).view(org_shape)
 
             unmapped_topk_idx = None
             fix_routing_mask = None
