@@ -1,0 +1,184 @@
+{
+ "k6/128": {
+  "cluster_shape_mn": [
+   4,
+   1
+  ],
+  "epi_flag_batches": [
+   2,
+   4
+  ],
+  "fallback_cluster_shape_mn": null,
+  "fc2_tma_stages": 2,
+  "fc2_use_bulk": true,
+  "mma_tiler_mnk": [
+   256,
+   128,
+   256
+  ],
+  "reduce_topk_in_kernel": false,
+  "schedule_policy": [
+   "phase_interleave",
+   6
+  ],
+  "token_back_mode": "epi_warps",
+  "token_in_flag_batch": 1,
+  "work_id_mode": "atomic_counter"
+ },
+ "k6/256": {
+  "cluster_shape_mn": [
+   4,
+   1
+  ],
+  "epi_flag_batches": [
+   2,
+   4
+  ],
+  "fallback_cluster_shape_mn": null,
+  "fc2_tma_stages": 2,
+  "fc2_use_bulk": true,
+  "mma_tiler_mnk": [
+   256,
+   128,
+   256
+  ],
+  "reduce_topk_in_kernel": false,
+  "schedule_policy": [
+   "phase_interleave",
+   4
+  ],
+  "token_back_mode": "epi_warps",
+  "token_in_flag_batch": 1,
+  "work_id_mode": "atomic_counter"
+ },
+ "k6/288": {
+  "cluster_shape_mn": [
+   4,
+   1
+  ],
+  "epi_flag_batches": [
+   2,
+   4
+  ],
+  "fallback_cluster_shape_mn": null,
+  "fc2_tma_stages": 2,
+  "fc2_use_bulk": true,
+  "mma_tiler_mnk": [
+   256,
+   128,
+   256
+  ],
+  "reduce_topk_in_kernel": false,
+  "schedule_policy": [
+   "phase_interleave",
+   4
+  ],
+  "token_back_mode": "epi_warps",
+  "token_in_flag_batch": 1,
+  "work_id_mode": "atomic_counter"
+ },
+ "k6/32": {
+  "cluster_shape_mn": [
+   4,
+   1
+  ],
+  "epi_flag_batches": [
+   2,
+   4
+  ],
+  "fallback_cluster_shape_mn": null,
+  "fc2_tma_stages": 2,
+  "fc2_use_bulk": true,
+  "mma_tiler_mnk": [
+   256,
+   128,
+   256
+  ],
+  "reduce_topk_in_kernel": false,
+  "schedule_policy": [
+   "phase_interleave",
+   6
+  ],
+  "token_back_mode": "epi_warps",
+  "token_in_flag_batch": 1,
+  "work_id_mode": "atomic_counter"
+ },
+ "k6/320": {
+  "cluster_shape_mn": [
+   4,
+   1
+  ],
+  "epi_flag_batches": [
+   2,
+   4
+  ],
+  "fallback_cluster_shape_mn": null,
+  "fc2_tma_stages": 2,
+  "fc2_use_bulk": true,
+  "mma_tiler_mnk": [
+   256,
+   128,
+   256
+  ],
+  "reduce_topk_in_kernel": false,
+  "schedule_policy": [
+   "phase_interleave",
+   4
+  ],
+  "token_back_mode": "epi_warps",
+  "token_in_flag_batch": 1,
+  "work_id_mode": "atomic_counter"
+ },
+ "k6/512": {
+  "cluster_shape_mn": [
+   4,
+   1
+  ],
+  "epi_flag_batches": [
+   2,
+   4
+  ],
+  "fallback_cluster_shape_mn": null,
+  "fc2_tma_stages": 2,
+  "fc2_use_bulk": true,
+  "mma_tiler_mnk": [
+   256,
+   128,
+   256
+  ],
+  "reduce_topk_in_kernel": false,
+  "schedule_policy": [
+   "phase_interleave",
+   3
+  ],
+  "token_back_mode": "epi_warps",
+  "token_in_flag_batch": 1,
+  "work_id_mode": "atomic_counter"
+ },
+ "k6/64": {
+  "cluster_shape_mn": [
+   4,
+   1
+  ],
+  "epi_flag_batches": [
+   2,
+   4
+  ],
+  "fallback_cluster_shape_mn": null,
+  "fc2_tma_stages": 2,
+  "fc2_use_bulk": true,
+  "mma_tiler_mnk": [
+   256,
+   128,
+   256
+  ],
+  "reduce_topk_in_kernel": false,
+  "schedule_policy": [
+   "phase_interleave",
+   6
+  ],
+  "token_back_mode": "epi_warps",
+  "token_in_flag_batch": 1,
+  "work_id_mode": "atomic_counter"
+ }
+}
