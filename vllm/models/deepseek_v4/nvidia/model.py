@@ -379,7 +379,21 @@ class DeepseekV4MoE(nn.Module):
             and (self.use_sequence_parallel or self.tp_size == 1)
         )
 
-        self.experts = DeepGemmMegaMoEExperts(
+        experts_cls = DeepGemmMegaMoEExperts
+        weight_format = MEGA_MOE_MXFP4
+        # MOSCA: the official CuTe DSL MegaMoE through FlashInfer's SM107 moe_ep entry
+        # (VLLM_MOSCA_OFFICIAL_MEGAMOE=1; default off), with the routed format the checkpoint names for this
+        # layer (w4a8 MXFP4 or w4a4 NVFP4). The gate above and the call below are unchanged.
+        import os
+
+        if os.environ.get("VLLM_MOSCA_OFFICIAL_MEGAMOE", "0").strip() not in ("", "0"):
+            from vllm.model_executor.layers.fused_moe.mosca_official_megamoe import (
+                MoscaOfficialMegaMoEExperts as experts_cls,
+                checkpoint_weight_format,
+            )
+
+            weight_format, _ = checkpoint_weight_format(vllm_config, prefix)
+        self.experts = experts_cls(
             vllm_config,
             num_experts=self.n_physical_experts,
             num_local_experts=self.n_local_physical_experts,
@@ -388,7 +402,7 @@ class DeepseekV4MoE(nn.Module):
             top_k=self.n_activated_experts,
             hidden_size=config.hidden_size,
             intermediate_size=config.moe_intermediate_size,
-            weight_format=MEGA_MOE_MXFP4,
+            weight_format=weight_format,
             activation=MegaMoEActivation(
                 "swiglu",
                 clamp=None if self.swiglu_limit is None else float(self.swiglu_limit),
