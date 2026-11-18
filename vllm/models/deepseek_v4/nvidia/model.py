@@ -514,6 +514,27 @@ class DeepseekV4MoE(nn.Module):
                 raise RuntimeError(
                     "MegaMoE routing metadata must be prepared once by the model."
                 )
+            # FRONT2 (VLLM_NVFP4_MEGAMOE_FRONT2=1, default off): this gate, the
+            # EPLB map and the NVFP4 experts' staging in one DeepGEMM launch.
+            # Hash-routed layers keep the separate gate.
+            front2_ready = getattr(self.experts, "front2_ready", None)
+            if (
+                front2_ready is not None
+                and self.gate.tid2eid is None
+                and self.gate.e_score_correction_bias is not None
+                and front2_ready()
+            ):
+                return self.experts.forward_front2(
+                    hidden_states,
+                    self.gate.weight,
+                    self.gate.e_score_correction_bias.data,
+                    self.n_activated_experts,
+                    scoring_func=self.scoring_func,
+                    routed_scaling_factor=self.routed_scaling_factor,
+                    ep_rank=self.ep_rank,
+                    image_bias=bias_vl.data if bias_vl is not None else None,
+                    image_token_mask=mega_gate_metadata.image_token_mask,
+                ).view(org_shape)
 
             unmapped_topk_idx = None
             fix_routing_mask = None

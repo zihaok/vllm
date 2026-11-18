@@ -33,6 +33,8 @@ EPLB (``--enable-eplb``) on NVFP4 layers:
   per-rank blocks and its tuned settings are looked up by the logical count.
 """
 
+import atexit
+import collections
 import logging
 import math
 import os
@@ -76,6 +78,27 @@ _ROUTED_NAMES = (
 # Per-slot fp32 buffers derived from weight_scale_2 that EPLB must move with the experts (appended to the views).
 _EPLB_ALPHA_NAMES = ("_fc1_alpha", "_fc2_alpha")
 _eplb_logged: set[tuple] = set()
+
+# FRONT2 (opt-in, default off): above the GateLinear threshold, where the model's gate is DeepGEMM's bf16_mega_gate,
+# one DeepGEMM bf16_mega_gate_front2 launch runs that gate (same config, top-k and weights; bias, image bias and mask),
+# the EPLB map and load record and this runtime's staging, writing the planes run() would stage (staging rule 1 =
+# stage_nvfp4_mxfp8's bytes); the kernel then runs on them (runtime.launch). Hash-routed layers keep the unfused front.
+FRONT2_ENV = "VLLM_NVFP4_MEGAMOE_FRONT2"
+FRONT2_STAGING_RULE = 1  # bf16_mega_gate_front2 staging_rule: the SM107 runtime's Triton staging
+_front2_census: dict[str, Any] = {"layers": collections.Counter(), "calls": 0, "rank": "?", "atexit": False}
+
+
+def front2_enabled() -> bool:
+    value = os.environ.get(FRONT2_ENV, "0").strip()
+    if value not in ("", "0", "1"):
+        raise ValueError(f"{FRONT2_ENV} must be 0 or 1, got {value!r}")
+    return value == "1"
+
+
+def _front2_census_line(tag: str) -> None:
+    layers = ",".join(f"{k}:{v}" for k, v in sorted(_front2_census["layers"].items())) or "none"
+    logger.info("NVFP4 MegaMoE FRONT2 census tag=%s rank=%s layers=%s calls=%d", tag, _front2_census["rank"], layers,
+                _front2_census["calls"])
 
 
 def is_nvfp4_routed_layer(vllm_config: Any, prefix: str) -> bool:
@@ -547,6 +570,95 @@ class VllmNvfp4MegaMoEExperts(DeepGemmMegaMoEExperts):
             hidden_states, topk_ids, topk_weights, is_padding, bucket=bucket, layer_kwargs=self._nvfp4_kwargs,
             norm=self._input_norm_const, scale_mul=self._scale_mul, eplb=eplb,
         )
+        return y[:num_tokens]
+
+    # ------------------------------------------------------------------------------------------------- FRONT2
+    def front2_ready(self) -> bool:
+        """FRONT2 serves this layer's next gate + call (decided once per layer: ``armed``, ``off`` or
+        ``unavailable:<why>``), not while a routing capture needs the logical ids (FRONT2 writes physical ids only)."""
+        if not self.__dict__.get("_front2_word"):
+            self._front2_decide()
+        return self.__dict__["_front2_fn"] is not None and self.capture_fn is None
+
+    def _front2_decide(self) -> None:
+        fn, word = None, "off"
+        if front2_enabled() and not getattr(self, "_nvfp4", True):  # a class that also serves MXFP4 layers
+            word = "not_admitted:not_nvfp4"
+        elif front2_enabled():
+            from flashinfer.moe_ep.sm107_nvfp4 import Nvfp4MegaMoERuntime
+            from vllm.utils.deep_gemm import _import_deep_gemm, _lazy_init
+
+            _lazy_init()  # the JIT cache dir and PDL setting bf16_mega_gate gets
+            dg = _import_deep_gemm()
+            fn = getattr(dg, "bf16_mega_gate_front2", None) if dg is not None else None
+            if fn is None:
+                word = "unavailable:deep_gemm_lacks_bf16_mega_gate_front2"
+            elif not hasattr(Nvfp4MegaMoERuntime, "external_planes"):
+                fn, word = None, "unavailable:flashinfer_lacks_external_planes"
+            else:
+                word = "armed"
+            rank = get_ep_group().rank_in_group
+            _front2_census["rank"] = rank
+            logger.info("NVFP4 MegaMoE FRONT2 layer=%s rank=%d word=%s", self.prefix, rank, word)
+            if not _front2_census["atexit"]:
+                atexit.register(_front2_census_line, "exit")
+                _front2_census["atexit"] = True
+        object.__setattr__(self, "_front2_fn", fn)
+        object.__setattr__(self, "_front2_word", word)
+        _front2_census["layers"][word.split(":")[0]] += 1
+
+    def forward_front2(
+        self,
+        hidden_states: torch.Tensor,
+        gate_weight: torch.Tensor,
+        gate_bias: torch.Tensor,
+        top_k: int,
+        *,
+        scoring_func: str,
+        routed_scaling_factor: float,
+        ep_rank: int,
+        image_bias: torch.Tensor | None = None,
+        image_token_mask: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """The model's ``bf16_mega_gate`` and :meth:`forward` in one FRONT2 launch + the kernel launch (the same
+        planes and outputs as gate -> staging -> kernel)."""
+        if self.__dict__.get("_front2_fn") is None:
+            word = self.__dict__.get("_front2_word") or "undecided"
+            raise RuntimeError(f"{self.prefix}: FRONT2 called while not armed ({word})")
+        num_tokens = hidden_states.shape[0]
+        if num_tokens > self.max_num_tokens:
+            raise ValueError(f"MegaMoE got {num_tokens} tokens, but was sized for {self.max_num_tokens}.")
+        self._synchronize_first_launch()
+        runtime = self.get_symm_buffer()
+        bucket = runtime.bucket(self._bucket_tokens(num_tokens))
+        is_padding = None
+        if is_forward_context_available():
+            import vllm.envs as envs
+
+            if envs.VLLM_MOE_SKIP_PADDING:
+                is_padding = get_forward_context().is_padding
+                if is_padding is not None:
+                    is_padding = is_padding[:num_tokens]
+        if not hidden_states.is_contiguous():
+            hidden_states = hidden_states.contiguous()
+        eplb = eplb_kernel_args(self.eplb_state)
+        check_eplb_args(eplb, self.num_logical_experts, self.num_experts, self.prefix)
+        mapping, replicas, load, record, unpadded = eplb[:5]
+        planes = runtime.external_planes(bucket)
+        self._front2_fn(
+            hidden_states, gate_weight, top_k, routed_scaling_factor, ep_rank, gate_bias,
+            planes["act"], planes["act_sf"], planes["topk_idx"], planes["topk_weights"],
+            scoring_func=scoring_func, image_bias=image_bias, image_token_mask=image_token_mask, format=0,
+            norm_const=self._input_norm_const, scale_multiplier=self._scale_mul, is_padding=is_padding,
+            logical_to_physical=mapping, replica_count=replicas, expert_load=load, record_enabled=record,
+            num_unpadded_tokens=unpadded, xs_q=planes["shared_act"], xs_sf=planes["shared_act_sf"],
+            staging_rule=FRONT2_STAGING_RULE,
+        )
+        _front2_census["calls"] += 1
+        calls = _front2_census["calls"]
+        if calls & (calls - 1) == 0 and calls <= 4096:
+            _front2_census_line("running")
+        y = runtime.launch(bucket, self._nvfp4_kwargs)
         return y[:num_tokens]
 
 
