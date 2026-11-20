@@ -1,0 +1,19 @@
+{
+ "about": "Split table of the clustered sparse-MLA decode: index width 640 -> 16 CTAs x 40 keys per token up to 6 rows, 8 CTAs x 80 keys up to 18 rows, FP16 partials merged through DSMEM; width 128 and calls above 18 rows have no rule (admit refuses: FlashInfer keeps them).",
+ "rules": [
+  {
+   "width": 640,
+   "max_rows": 6,
+   "S": 16,
+   "KPC": 40,
+   "merge": "dsmem16"
+  },
+  {
+   "width": 640,
+   "max_rows": 18,
+   "S": 8,
+   "KPC": 80,
+   "merge": "dsmem16"
+  }
+ ]
+}

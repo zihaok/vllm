@@ -36,6 +36,26 @@ from ...flashinfer_sparse import (
 
 logger = init_logger(__name__)
 
+# The decode calls the clustered sparse-MLA decode admits (mosca_smla.py next to this
+# file: FP8 query and KV, 16 heads, cum_seq_lens_q given, float scales, an index width
+# and row count in split_table.json, the kernel library loaded) run it instead of
+# FlashInfer TRT-LLM-gen; every other call keeps FlashInfer. mosca_smla.census logs
+# the routing.
+
+
+def _mosca_decode(**kw) -> bool:
+    """Run the call on the clustered sparse-MLA decode when it admits it; False
+    keeps FlashInfer's call."""
+    from . import mosca_smla
+
+    reason = mosca_smla.admit(**kw)
+    mosca_smla.census(kw["query"].shape[0], kw["sparse_indices"].shape[-1], reason)
+    if reason is not None:
+        return False
+    mosca_smla.run(**kw)
+    return True
+
+
 if TYPE_CHECKING:
     from vllm.v1.attention.backends.mla.sparse_swa import DeepseekSparseSWAMetadata
 
@@ -116,6 +136,20 @@ def trtllm_decode_sparse_mla_dsv4(
     """``trtllm_batch_decode_sparse_mla_dsv4`` for ``sparse_indices`` that are
     KV storage offsets, on ``kv_counters`` (from ``kv_counter_buffer``) when
     they are large enough for the launch."""
+    if _mosca_decode(
+        query=query,
+        swa_kv_cache=swa_kv_cache,
+        compressed_kv_cache=compressed_kv_cache,
+        sparse_indices=sparse_indices,
+        sparse_topk_lens=sparse_topk_lens,
+        seq_lens=seq_lens,
+        out=out,
+        bmm1_scale=bmm1_scale,
+        bmm2_scale=bmm2_scale,
+        sinks=sinks,
+        cum_seq_lens_q=cum_seq_lens_q,
+    ):
+        return
     counter_kwargs: dict[str, torch.Tensor] = {}
     if kv_counters is not None:
         from flashinfer.utils import (
@@ -323,6 +357,17 @@ class SparseMlaDecode:
     def __init__(self, tables: SparseIndexTables, max_rows: int) -> None:
         self.tables = tables
         self.kv_counters = kv_counter_buffer(max_rows)
+        # Load (or JIT-build) the kernel library now, outside any CUDA graph capture;
+        # without it every call keeps FlashInfer.
+        from . import mosca_smla
+
+        reason = mosca_smla.lib_ok()
+        if reason is not None:
+            logger.warning(
+                "clustered sparse-MLA decode unavailable (%s): "
+                "every decode call keeps FlashInfer",
+                reason,
+            )
 
     def run(
         self, attn: DeepseekV4FlashInferMLAAttention, q: torch.Tensor, out: torch.Tensor
