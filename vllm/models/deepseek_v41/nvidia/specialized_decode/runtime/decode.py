@@ -53,7 +53,7 @@ from ..attention.sparse_mla import SparseIndexTables, SparseMlaDecode
 from ..attention.step import AttentionStep
 from ..boundary.boundary import Boundaries, BoundaryState
 from ..engram.prefetch import EngramPrefetch
-from ..moe.routed_expert_gemm import build_routed_expert_gemms
+from ..moe.routed_expert_gemm import build_lb24_gemms, build_routed_expert_gemms
 from ..moe.step import MoEStep
 
 if TYPE_CHECKING:
@@ -215,6 +215,7 @@ class SpecializedDecode:
             ENGRAM_PREFETCH_MAX_ROWS,
         )
         gemms = build_routed_expert_gemms([layer.ffn.experts for layer in layers])
+        gemms24 = build_lb24_gemms([layer.ffn.experts for layer in layers])
         quantize = self.all_reduce.quantize_layer_input
         self.plans = [
             LayerPlan(
@@ -229,11 +230,15 @@ class SpecializedDecode:
                     source=self.candidates if attn is source else None,
                     consumer=self.candidates if attn in consumers else None,
                 ),
-                moe=MoEStep(layer.ffn, gemm, FUSED_MHC_MAX_ROWS),
+                moe=MoEStep(layer.ffn, gemm, FUSED_MHC_MAX_ROWS, gemm24),
                 engram=layer.engram,
             )
-            for layer_id, layer, attn, gemm in zip(
-                range(backbone.start_layer, backbone.end_layer), layers, attns, gemms
+            for layer_id, layer, attn, gemm, gemm24 in zip(
+                range(backbone.start_layer, backbone.end_layer),
+                layers,
+                attns,
+                gemms,
+                gemms24,
             )
         ]
         self._swa_prefixes = sorted({attn.swa_cache_layer.prefix for attn in attns})

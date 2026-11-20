@@ -35,7 +35,7 @@ from vllm.model_executor.layers.fused_moe.runner.shared_experts import (
     SharedExpertsOrder,
 )
 
-from .routed_expert_gemm import RoutedExpertGemm, front_applies
+from .routed_expert_gemm import LB24_MAX_ROWS, RoutedExpertGemm, front_applies
 
 if TYPE_CHECKING:
     from ...model import DeepseekV4MoE
@@ -76,13 +76,20 @@ class MoEStep:
     """One MoE layer of the decode step."""
 
     def __init__(
-        self, ffn: "DeepseekV4MoE", gemm: RoutedExpertGemm | None, max_rows: int
+        self,
+        ffn: "DeepseekV4MoE",
+        gemm: RoutedExpertGemm | None,
+        max_rows: int,
+        gemm24=None,
     ) -> None:
         self.ffn = ffn
         self.runner = ffn.experts
         self.deferrable = defers_finalize(ffn, max_rows)
         # The low-batch GEMMs leave the top-k reduction open too.
         self.gemm = gemm if self.deferrable else None
+        # The 9-24-row NVFP4 low-batch MoE (routed_expert_gemm_lb24.py; None for
+        # layers it does not cover).
+        self.gemm24 = gemm24 if self.deferrable else None
 
     def run(
         self, x: torch.Tensor, input_ids: torch.Tensor | None, step: "DecodeStep"
@@ -93,6 +100,15 @@ class MoEStep:
         gemm = self.gemm
         if step.low_batch and gemm is not None and gemm.accepts(x, self.runner):
             routed, shared_output = self._forward_low_batch(gemm, x, input_ids)
+            return MoEOutput(routed=routed, shared_output=shared_output)
+        gemm24 = self.gemm24
+        if (
+            gemm24 is not None
+            and not step.low_batch
+            and x.shape[0] <= LB24_MAX_ROWS
+            and gemm24.accepts(x, self.runner)
+        ):
+            routed, shared_output = self._forward_low_batch(gemm24, x, input_ids)
             return MoEOutput(routed=routed, shared_output=shared_output)
         # The runner's custom op returns tensors only, so run its body directly.
         with deferred_finalize(self.runner.moe_config, x.shape[0]):

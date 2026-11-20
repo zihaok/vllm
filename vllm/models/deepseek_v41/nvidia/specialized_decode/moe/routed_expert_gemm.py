@@ -88,6 +88,9 @@ PADDED = 640
 # The NVFP4 experts' intermediate at TP4: vLLM pads a gated NVFP4 intermediate
 # to a multiple of 64 only, so 576 stays unpadded.
 NV_INTERMEDIATE = 576
+# Above the low-batch rows (9-24 rows: 2-4 DSpark requests) NVFP4 layers take the
+# 9-24-row low-batch MoE (routed_expert_gemm_lb24.py) instead of FlashInfer TRT-LLM-gen.
+LB24_MAX_ROWS = 24
 # The fused front is built for exactly the target layers' routing.
 EXPERTS = 384
 TOP_K = 6
@@ -994,3 +997,91 @@ def build_routed_expert_gemms(
         else "",
     )
     return gemms
+
+
+def _lb24_unsupported_reason(runner: torch.nn.Module) -> str | None:
+    """Why a layer's experts cannot take the 9-24-row NVFP4 low-batch MoE."""
+    from vllm.model_executor.layers.fused_moe.activation import MoEActivation
+    from vllm.model_executor.layers.fused_moe.experts.trtllm_nvfp4_moe import (
+        TrtLlmNvFp4ExpertsModular,
+    )
+
+    reason = _unsupported_reason(runner)
+    if reason is not None:
+        return reason
+    impl = runner.routed_experts.quant_method.moe_kernel.fused_experts
+    if not isinstance(impl, TrtLlmNvFp4ExpertsModular):
+        return f"experts {type(impl).__name__}"
+    config, quant = impl.moe_config, impl.quant_config
+    if config.activation != MoEActivation.SILU:
+        return f"activation {config.activation}"
+    if impl.gemm1_alpha is not None or impl.gemm1_beta is not None:
+        return "gemm1 alpha / beta"
+    if impl.local_num_experts != config.num_experts:
+        return "expert parallelism"
+    if runner.routed_scaling_factor != 1.0:
+        return "routed scaling on the runner"
+    if getattr(impl, "per_token_activation", False):
+        return "per-token activation scales"
+    if impl._gemm1_clamp_limit_unfolded is None:
+        return "no SwiGLU clamp"
+    for name in ("g1_alphas", "a2_gscale", "g2_alphas", "a1_gscale"):
+        if getattr(quant, name, None) is None:
+            return f"{name} absent"
+    return None
+
+
+def build_lb24_gemms(runners: list[torch.nn.Module]) -> list:
+    """A 9-24-row NVFP4 low-batch MoE (``RoutedExpertGemmLB24``) with its fused
+    front for each NVFP4 MoE runner that supports it (None elsewhere: those
+    layers keep FlashInfer above the low-batch rows)."""
+    from .routed_expert_gemm_lb24 import RoutedExpertGemmLB24
+
+    reasons: Counter[str] = Counter()
+    out: list = []
+    fronts = 0
+    for runner in runners:
+        gemm = None
+        reason = _lb24_unsupported_reason(runner)
+        if reason is not None:
+            reasons[reason] += 1
+        else:
+            routed = runner.routed_experts
+            impl = routed.quant_method.moe_kernel.fused_experts
+            quant = impl.quant_config
+            try:
+                gemm = RoutedExpertGemmLB24(
+                    routed.w13_weight,
+                    quant.w1_scale,
+                    routed.w2_weight,
+                    quant.w2_scale,
+                    impl._gemm1_clamp_limit_unfolded,
+                    quant.g1_alphas,
+                    quant.a2_gscale,
+                    quant.g2_alphas,
+                    quant.a1_gscale,
+                    impl.topk,
+                )
+            except ValueError as error:
+                reasons[str(error)] += 1
+            if gemm is not None:
+                front = _front_config(runner)
+                if isinstance(front, str):
+                    reasons[f"fused front: {front}"] += 1
+                else:
+                    gemm.set_front(front)
+                    fronts += 1
+        out.append(gemm)
+    logger.info(
+        "DeepSeek-V4.1 9-%d-row NVFP4 low-batch MoE on %d of %d MoE layers "
+        "(%d with the fused front)%s.",
+        LB24_MAX_ROWS,
+        sum(g is not None for g in out),
+        len(runners),
+        fronts,
+        "; other layers keep FlashInfer: "
+        + "; ".join(f"{r} ({n})" for r, n in reasons.items())
+        if reasons
+        else "",
+    )
+    return out
