@@ -58,6 +58,7 @@ from vllm.model_executor.layers.fused_moe.moe_output import UnfinalizedMoEOutput
 from vllm.models.common.ops.moe_tail_fusion.primitives import current_cu_stream
 
 from .routed_expert_front_cute import RoutedExpertFront
+from .routed_expert_front_nvfp4_cute import RoutedExpertFrontNvfp4
 from .routed_expert_gemm_cute import (
     RoutedExpertGemm1,
     RoutedExpertGemm2,
@@ -333,10 +334,12 @@ class RoutedExpertGemmNvfp4(RoutedExpertGemm):
     """The route kernel and the NVFP4 (W4A4) GEMM pair bound to one MoE
     layer's TRT-LLM-gen NVFP4 experts (``routed_expert_gemm_nvfp4_cute.py``).
 
-    The input is quantized by the modular kernel's prepare (NVFP4 with the
+    The input is quantized as the modular kernel's prepare does (NVFP4 with the
     layer's static global scale, linear E4M3 block scales), so the activations
-    match the stock path bit for bit; routing takes the router's top-k (the
-    fused front is MXFP8-only).
+    match the stock path bit for bit: by the fused NVFP4 front
+    (``routed_expert_front_nvfp4_cute.py``: top-k, quantization and routing
+    record in one launch) where the router allows it, else by the prepare and
+    the route kernel on the router's top-k.
     """
 
     def __init__(
@@ -373,7 +376,73 @@ class RoutedExpertGemmNvfp4(RoutedExpertGemm):
         self.g1_alphas, self.g1_scale_c, self.g2_alphas = g1_alphas, g1_scale_c, g2_alphas
 
     def set_front(self, config: FrontConfig) -> None:
-        raise ValueError("the fused front quantizes to MXFP8 only")
+        """Use the fused NVFP4 front (``routed_expert_front_nvfp4_cute.py``) with
+        the router's ``config``; it quantizes as the modular kernel's prepare
+        does (one FP32 global scale, linear E4M3 block scales). Raises
+        ``ValueError`` for another input quantization, which then keeps the
+        top-k + ``route`` path."""
+        # The modular prepare's scaled_fp4_quant reads element 0 of the layer's
+        # input global scale (a per-expert tensor of equal values); the front
+        # reads the same element.
+        gscale = self.quant_config.a1_gscale
+        if (
+            gscale is None
+            or gscale.dtype != torch.float32
+            or gscale.numel() < 1
+            or not gscale.is_contiguous()
+        ):
+            raise ValueError("the NVFP4 front needs an FP32 input global scale")
+        if self.quant_config.is_scale_swizzled:
+            raise ValueError("the NVFP4 front writes linear block scales only")
+        _front_nvfp4_kernel(self.device_index, config.bias_vl is not None)
+        self.front_config = config
+
+    def front(
+        self, x: torch.Tensor, logits: torch.Tensor, input_ids: torch.Tensor | None
+    ) -> Routing:
+        """Top-k, NVFP4 quantization and routing record in one launch (the
+        outputs of the DSv4 top-k, ``route``'s quantization and the route
+        kernel, bitwise)."""
+        config = self.front_config
+        assert config is not None
+        rows = x.size(0)
+        device = x.device
+        ctas = max_ctas(rows, TOP_K, self.experts)
+        topk_ids = torch.empty((rows, TOP_K), dtype=torch.int32, device=device)
+        topk_weights = torch.empty((rows, TOP_K), dtype=torch.float32, device=device)
+        x_quant = torch.empty((rows, HIDDEN // 2), dtype=torch.uint8, device=device)
+        x_scale = torch.empty(
+            (rows, HIDDEN // NVFP4_SF_VEC), dtype=torch.uint8, device=device
+        )
+        permuted = torch.empty((rows, TOP_K), dtype=torch.int32, device=device)
+        record = torch.empty(route_words(ctas), dtype=torch.int32, device=device)
+        image = config.bias_vl is not None
+        ids = topk_ids
+        if image:
+            assert input_ids is not None
+            ids = input_ids
+        gscale = self.quant_config.a1_gscale
+        assert gscale is not None
+        _front_nvfp4_kernel(self.device_index, image)(
+            _pointer(cutlass.Float32, logits, 16),
+            _pointer(cutlass.Float32, config.bias, 16),
+            _pointer(cutlass.Float32, config.bias_vl if image else config.bias, 16),
+            _pointer(cutlass.Int32, ids, 4),
+            Int32(int(ids.dtype == torch.int64)),
+            Int32(config.image_sentinel_lo),
+            Float32(config.scale),
+            _pointer(cutlass.Uint32, x, 16),
+            _pointer(cutlass.Float32, gscale, 4),
+            _pointer(cutlass.Int32, topk_ids, 16),
+            _pointer(cutlass.Float32, topk_weights, 16),
+            _pointer(cutlass.Uint8, x_quant, 16),
+            _pointer(cutlass.Uint8, x_scale, 16),
+            _pointer(cutlass.Int32, permuted, 16),
+            _pointer(cutlass.Int32, record, 16),
+            Int32(rows),
+            current_cu_stream(),
+        )
+        return Routing(x_quant, x_scale, topk_ids, topk_weights, permuted, record, ctas)
 
     def route(
         self,
@@ -499,6 +568,33 @@ def _front_kernel(device_index: int, image: bool):
             Int32(0),
             Float32(1.0),
             _fake(cutlass.Uint32, 16),
+            _fake(cutlass.Int32, 16),
+            _fake(cutlass.Float32, 16),
+            _fake(cutlass.Uint8, 16),
+            _fake(cutlass.Uint8, 16),
+            _fake(cutlass.Int32, 16),
+            _fake(cutlass.Int32, 16),
+            Int32(1),
+            make_fake_stream(),
+        )
+
+
+@cache
+def _front_nvfp4_kernel(device_index: int, image: bool):
+    """``RoutedExpertFrontNvfp4`` compiled for a device, with or without image
+    routing."""
+    with torch.accelerator.device_index(device_index):
+        return cute.compile(
+            RoutedExpertFrontNvfp4(image),
+            _fake(cutlass.Float32, 16),
+            _fake(cutlass.Float32, 16),
+            _fake(cutlass.Float32, 16),
+            _fake(cutlass.Int32, 4),
+            Int32(0),
+            Int32(0),
+            Float32(1.0),
+            _fake(cutlass.Uint32, 16),
+            _fake(cutlass.Float32, 4),
             _fake(cutlass.Int32, 16),
             _fake(cutlass.Float32, 16),
             _fake(cutlass.Uint8, 16),
@@ -872,13 +968,16 @@ def build_routed_expert_gemms(
                     )
             except ValueError as error:
                 reasons[str(error)] += 1
-        if gemm is not None and not isinstance(gemm, RoutedExpertGemmNvfp4):
+        if gemm is not None:
             front = _front_config(runner)
             if isinstance(front, str):
                 reasons[f"fused front: {front}"] += 1
             else:
-                gemm.set_front(front)
-                fronts += 1
+                try:
+                    gemm.set_front(front)
+                    fronts += 1
+                except ValueError as error:
+                    reasons[f"fused front: {error}"] += 1
         gemms.append(gemm)
     # A layer that keeps FlashInfer under decode_backend=latency_specialized is a
     # deployment problem (e.g. unexpected weights), so it warns.
